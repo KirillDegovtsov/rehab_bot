@@ -683,7 +683,7 @@ async def cb_confirm_generate_plan(call: CallbackQuery, state: FSMContext):
             await msg.delete()
             await call.message.answer(
                 text,
-                reply_markup=get_edit_plan_kb(patient.id, status="draft", show_back_button=False),
+                reply_markup=get_edit_plan_kb(patient.id, status="draft"),
                 parse_mode="Markdown"
             )
         except Exception as e:
@@ -946,7 +946,7 @@ async def cb_open_edit_plan(call: CallbackQuery):
         text = f"📋 *План реабилитации*\nСтатус: {status_ru}\n\n{formatted_text}"
         await call.message.edit_text(
             text,
-            reply_markup=get_edit_plan_kb(patient_id, status=plan.status, show_back_button=True),
+            reply_markup=get_edit_plan_kb(patient_id, status=plan.status),
             parse_mode="Markdown"
         )
     await call.answer()
@@ -1125,6 +1125,28 @@ async def cb_edit_nutrition_menu(call: CallbackQuery):
 
 
 # --- ВЫБОР ПРИЁМА ПИЩИ ---
+@router.callback_query(F.data.startswith("edit_meal_food_"))
+async def cb_edit_meal_food(call: CallbackQuery, state: FSMContext):
+    # формат: edit_meal_food_{meal_key}_{patient_id}
+    suffix = call.data[len("edit_meal_food_"):]
+    meal_key, raw_id = suffix.rsplit("_", 1)
+    patient_id = int(raw_id)
+    async with async_session_maker() as session:
+        plan = await crud.get_rehab_plan(session, patient_id)
+        if not plan:
+            await call.answer("План не найден.", show_alert=True)
+            return
+        meals = plan.nutrition_json.get("nutrition", {}).get("meals", {})
+        current = meals.get(meal_key, "Не задано")
+    await state.update_data(patient_id=patient_id, meal_key=meal_key)
+    await state.set_state(EditPlanFSM.waiting_for_meal)
+    await call.message.answer(
+        f"Введите новые блюда.\nСтарые блюда: {current}",
+        reply_markup=back_kb()
+    )
+    await call.answer()
+
+
 @router.callback_query(F.data.startswith("edit_meal_"))
 async def cb_edit_meal(call: CallbackQuery):
     # edit_meal_food_ обрабатывается отдельным обработчиком cb_edit_meal_food
@@ -1146,26 +1168,6 @@ async def cb_edit_meal(call: CallbackQuery):
     )
     await call.answer()
     
-@router.callback_query(F.data.startswith("edit_meal_food_"))
-async def cb_edit_meal_food(call: CallbackQuery, state: FSMContext):
-    # формат: edit_meal_food_{meal_key}_{patient_id}
-    suffix = call.data[len("edit_meal_food_"):]
-    meal_key, raw_id = suffix.rsplit("_", 1)
-    patient_id = int(raw_id)
-    async with async_session_maker() as session:
-        plan = await crud.get_rehab_plan(session, patient_id)
-        if not plan:
-            await call.answer("План не найден.", show_alert=True)
-            return
-        meals = plan.nutrition_json.get("nutrition", {}).get("meals", {})
-        current = meals.get(meal_key, "Не задано")
-    await state.update_data(patient_id=patient_id, meal_key=meal_key)
-    await state.set_state(EditPlanFSM.waiting_for_meal)
-    await call.message.answer(
-        f"Введите новые блюда.\nСтарые блюда: {current}",
-        reply_markup=back_kb()
-    )
-    await call.answer()
     
 @router.callback_query(F.data.startswith("delete_meal_"))
 async def cb_delete_meal(call: CallbackQuery, state: FSMContext):
@@ -1200,9 +1202,15 @@ async def cb_delete_meal(call: CallbackQuery, state: FSMContext):
 # --- СОХРАНЕНИЕ НОВОГО МЕНЮ ---
 @router.message(EditPlanFSM.waiting_for_meal)
 async def process_meal_input(message: Message, state: FSMContext):
+    # 1. Валидация ПЕРЕД очисткой стейта
+    valid, result = validate_russian_text(message.text)
+    if not valid:
+        await message.answer(result, reply_markup=back_kb())
+        return  # остаёмся в состоянии waiting_for_meal, кнопка "Назад" остаётся
+
     data = await state.get_data()
     patient_id = data.get("patient_id")
-    meal_key   = data.get("meal_key")
+    meal_key = data.get("meal_key")
     await state.clear()
 
     async with async_session_maker() as session:
@@ -1218,17 +1226,19 @@ async def process_meal_input(message: Message, state: FSMContext):
         if "meals" not in new_nutrition_json["nutrition"]:
             new_nutrition_json["nutrition"]["meals"] = {}
 
-        new_nutrition_json["nutrition"]["meals"][meal_key] = message.text
+        new_nutrition_json["nutrition"]["meals"][meal_key] = result  # result — уже strip()
         plan.nutrition_json = new_nutrition_json
         flag_modified(plan, "nutrition_json")
         await session.commit()
         await session.refresh(plan)
-        formatted_text = format_rehab_plan_text(plan.exercises_json, plan.nutrition_json)
 
+    # 2. Убираем кнопку "Назад" — ТОЛЬКО после успешного сохранения
     await message.answer("✅ Меню обновлено.", reply_markup=ReplyKeyboardRemove())
+
+    meal_name = MEAL_NAMES_RU.get(meal_key, meal_key.capitalize())
     await message.answer(
-        f"📋 *Обновлённый план*\n\n{formatted_text}",
-        reply_markup=get_edit_plan_kb(patient_id, status="draft"),
+        f"Приём пищи: *{meal_name}*\nВыберите действие:",
+        reply_markup=meal_actions_kb(meal_key, patient_id),
         parse_mode="Markdown"
     )
 
@@ -1247,11 +1257,7 @@ async def cb_back_to_plan(call: CallbackQuery):
     text = f"📋 *План реабилитации*\nСтатус: {status_ru}\n\n{formatted_text}"
     await call.message.edit_text(
         text,
-        reply_markup=get_edit_plan_kb(
-            patient_id,
-            status=plan.status,
-            show_back_button=True
-        ),
+        reply_markup=get_edit_plan_kb(patient_id, status=plan.status),
         parse_mode="Markdown"
     )
     await call.answer()

@@ -64,20 +64,13 @@ def edit_patient_fields_kb(patient_id: int) -> InlineKeyboardMarkup:
 def get_edit_plan_kb(
     patient_id: int,
     status: str = "draft",
-    show_back_button: bool = False
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-
     if status != "active":
         builder.button(text="✅ Одобрить план",        callback_data=f"approve_{patient_id}")
-        builder.button(text="🏋️ Изменить упражнения",  callback_data=f"edit_exercises_menu_{patient_id}")
-        builder.button(text="🍽️ Изменить питание",     callback_data=f"edit_nutrition_menu_{patient_id}")
+        builder.button(text="🏋️ Изменить упражнения", callback_data=f"edit_exercises_menu_{patient_id}")
+        builder.button(text="🍽️ Изменить питание",    callback_data=f"edit_nutrition_menu_{patient_id}")
         builder.adjust(1)
-    
-    if show_back_button:
-        builder.button(text="🔙 Назад к пациенту", callback_data=f"patient_card_{patient_id}")
-        builder.adjust(1)
-
     return builder.as_markup()
 
 

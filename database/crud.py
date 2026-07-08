@@ -1,0 +1,98 @@
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from .models import Doctor, Patient, RehabPlan
+
+
+async def get_or_create_doctor(session: AsyncSession, tg_id: int, fio: str) -> Doctor:
+    stmt = select(Doctor).where(Doctor.telegram_id == tg_id)
+    result = await session.execute(stmt)
+    doctor = result.scalar_one_or_none()
+    if not doctor:
+        doctor = Doctor(telegram_id=tg_id, fio=fio)
+        session.add(doctor)
+        await session.commit()
+    return doctor
+
+
+async def create_patient(session: AsyncSession, doctor_id: int, patient_data: dict) -> Patient:
+    patient = Patient(doctor_id=doctor_id, **patient_data)
+    session.add(patient)
+    await session.commit()
+    await session.refresh(patient)
+    return patient
+
+
+async def create_or_update_rehab_plan(
+    session: AsyncSession,
+    patient_id: int,
+    plan_data: dict,
+    status: str = 'draft'
+) -> RehabPlan:
+    stmt = select(RehabPlan).where(RehabPlan.patient_id == patient_id)
+    result = await session.execute(stmt)
+    plan = result.scalar_one_or_none()
+
+    if plan:
+        plan.exercises_json = plan_data.get('exercises_json', plan.exercises_json)
+        plan.nutrition_json = plan_data.get('nutrition_json', plan.nutrition_json)
+        plan.status = status
+    else:
+        plan = RehabPlan(
+            patient_id=patient_id,
+            exercises_json=plan_data['exercises_json'],
+            nutrition_json=plan_data['nutrition_json'],
+            status=status
+        )
+        session.add(plan)
+
+    await session.commit()
+    await session.refresh(plan)
+    return plan
+
+
+async def get_rehab_plan(session: AsyncSession, patient_id: int) -> RehabPlan:
+    stmt = select(RehabPlan).where(RehabPlan.patient_id == patient_id)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def get_patients_by_doctor(session: AsyncSession, doctor_id: int):
+    stmt = select(Patient).where(Patient.doctor_id == doctor_id)
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def get_patient(session: AsyncSession, patient_id: int) -> Patient:
+    stmt = select(Patient).where(Patient.id == patient_id)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def delete_patient(session: AsyncSession, patient_id: int):
+    patient = await get_patient(session, patient_id)
+    if patient:
+        await session.delete(patient)
+        await session.commit()
+
+
+async def update_patient(
+    session: AsyncSession,
+    patient_id: int,
+    update_data: dict
+) -> Patient:
+    patient = await get_patient(session, patient_id)
+    if patient:
+        for key, value in update_data.items():
+            setattr(patient, key, value)
+        await session.commit()
+        await session.refresh(patient)
+    return patient
+
+
+async def get_patient_by_username(
+    session: AsyncSession,
+    username: str
+) -> Patient:
+    stmt = select(Patient).where(Patient.username == username)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()

@@ -20,6 +20,8 @@ from keyboards.doctor_kb import (
     exercise_edit_kb,
     nutrition_menu_kb,
     confirm_generation_kb,
+    meal_actions_kb,
+    view_plan_kb,
 )
 from utils import format_rehab_plan_text
 
@@ -55,6 +57,8 @@ class EditPlanFSM(StatesGroup):
     add_exercise_desc = State()
     add_exercise_sets = State()
     add_exercise_reps = State()
+    add_meal_name     = State()
+    add_meal_food     = State()
 
 
 class EditPatientFieldFSM(StatesGroup):
@@ -275,8 +279,6 @@ async def _send_main_menu(message: Message):
 async def step_back(message: Message, state: FSMContext):
     current_state = await state.get_state()
 
-    # ИЗМЕНЕНО: при нажатии Назад во время редактирования поля
-    # возвращаем к меню выбора полей, а не к карточке пациента
     if current_state == EditPatientFieldFSM.waiting_value.state:
         data = await state.get_data()
         patient_id = data.get("patient_id")
@@ -298,11 +300,51 @@ async def step_back(message: Message, state: FSMContext):
             await _send_main_menu(message)
         return
 
-    # Возврат из редактирования плана
+    if current_state == EditPlanFSM.add_meal_name.state:
+        data = await state.get_data()
+        patient_id = data.get("patient_id")
+        await state.clear()
+        async with async_session_maker() as session:
+            plan = await crud.get_rehab_plan(session, patient_id)
+            meals = plan.nutrition_json.get("nutrition", {}).get("meals", {}) if plan else None
+        await message.answer("Добавление приёма пищи отменено.", reply_markup=ReplyKeyboardRemove())
+        await message.answer(
+            "Выберите приём пищи для редактирования:",
+            reply_markup=nutrition_menu_kb(patient_id, meals)
+        )
+        return
+
+    if current_state == EditPlanFSM.add_meal_food.state:
+        await state.set_state(EditPlanFSM.add_meal_name)
+        await message.answer(
+            "Введите название приёма пищи (только на русском):",
+            reply_markup=back_kb()
+        )
+        return
+
+    if current_state == EditPlanFSM.waiting_for_meal.state:
+        data = await state.get_data()
+        patient_id = data.get("patient_id")
+        meal_key = data.get("meal_key")
+        await state.clear()
+        await message.answer(
+            "Редактирование отменено.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        if patient_id and meal_key:
+            meal_name = MEAL_NAMES_RU.get(meal_key, meal_key.capitalize())
+            await message.answer(
+                f"Приём пищи: *{meal_name}*\nВыберите действие:",
+                reply_markup=meal_actions_kb(meal_key, patient_id),
+                parse_mode="Markdown"
+            )
+        else:
+            await _send_main_menu(message)
+        return
+
     if current_state in (
         EditPlanFSM.waiting_for_sets.state,
         EditPlanFSM.waiting_for_reps.state,
-        EditPlanFSM.waiting_for_meal.state,
     ):
         await state.clear()
         await message.answer(
@@ -319,7 +361,7 @@ async def step_back(message: Message, state: FSMContext):
         async with async_session_maker() as session:
             plan = await crud.get_rehab_plan(session, patient_id)
         exercises = plan.exercises_json.get("exercises", []) if plan else []
-        await message.answer("↩️", reply_markup=ReplyKeyboardRemove())  # убираем back_kb
+        await message.answer("↩️", reply_markup=ReplyKeyboardRemove())
         await message.answer(
             "Выберите упражнение для редактирования:",
             reply_markup=exercises_list_kb(patient_id, exercises)
@@ -350,7 +392,6 @@ async def step_back(message: Message, state: FSMContext):
         )
         return
 
-    # Навигация по шагам регистрации пациента
     for state_obj, (prev_state, text, kb) in FSM_STEPS.items():
         if current_state == state_obj.state:
             if prev_state is None:
@@ -360,7 +401,6 @@ async def step_back(message: Message, state: FSMContext):
             else:
                 await state.set_state(prev_state)
                 if prev_state == PatientRegistrationFSM.gender:
-                    # Возврат к выбору пола требует двух сообщений — текст + InlineKeyboard с кнопками
                     await message.answer(text, reply_markup=back_kb())
                     await message.answer("👇 Выберите пол:", reply_markup=gender_kb())
                 else:
@@ -650,6 +690,18 @@ async def cb_confirm_generate_plan(call: CallbackQuery, state: FSMContext):
             await msg.delete()
             await call.message.answer(f"❌ Ошибка генерации: {str(e)}")
             await _send_main_menu(call.message)
+  
+            
+@router.message(PatientRegistrationFSM.confirm_generation)
+async def confirm_generation_invalid_input(message: Message, state: FSMContext):
+    await message.answer(
+        "⚠️ Пожалуйста, воспользуйтесь кнопками ниже.",
+        reply_markup=back_kb()
+    )
+    await message.answer(
+        "Нажмите кнопку, чтобы сгенерировать реабилитационный план:",
+        reply_markup=confirm_generation_kb()
+    )
 
 
 # ===========================================================================
@@ -704,11 +756,25 @@ async def show_patient_card(call: CallbackQuery):
 async def delete_patient_handler(call: CallbackQuery):
     patient_id = int(call.data.split("_")[2])
     async with async_session_maker() as session:
+        # Читаем doctor_id ДО удаления, пока пациент ещё есть в БД
+        patient = await crud.get_patient(session, patient_id)
+        doctor_id = patient.doctor_id if patient else None
+
         await crud.delete_patient(session, patient_id)
-    await call.message.edit_text(
-        "✅ Пациент и его план успешно удалены.",
-        reply_markup=main_menu_kb()
-    )
+
+        # Получаем обновлённый список пациентов этого врача
+        patients = await crud.get_patients_by_doctor(session, doctor_id) if doctor_id else []
+
+    if patients:
+        await call.message.edit_text(
+            "✅ Пациент и его план успешно удалены.\n\nВыберите пациента из списка ниже:",
+            reply_markup=patient_list_kb(patients)
+        )
+    else:
+        await call.message.edit_text(
+            "✅ Пациент и его план успешно удалены. Список пациентов пуст.",
+            reply_markup=main_menu_kb()
+        )
     await call.answer()
 
 # ===========================================================================
@@ -851,24 +917,36 @@ async def edit_patient_field_save(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("view_plan_"))
 async def view_and_edit_plan(call: CallbackQuery):
     patient_id = int(call.data.split("_")[2])
-
     async with async_session_maker() as session:
         plan = await crud.get_rehab_plan(session, patient_id)
         if not plan:
             await call.answer("План ещё не создан!", show_alert=True)
             return
-
         formatted_text = format_rehab_plan_text(plan.exercises_json, plan.nutrition_json)
         status_ru = "✅ Активен" if plan.status == "active" else "📝 Черновик"
         text = f"📋 *План реабилитации*\nСтатус: {status_ru}\n\n{formatted_text}"
-
         await call.message.edit_text(
             text,
-            reply_markup=get_edit_plan_kb(
-                patient_id,
-                status=plan.status,
-                show_back_button=True
-            ),
+            reply_markup=view_plan_kb(patient_id),
+            parse_mode="Markdown"
+        )
+    await call.answer()
+    
+    
+@router.callback_query(F.data.startswith("open_edit_plan_"))
+async def cb_open_edit_plan(call: CallbackQuery):
+    patient_id = int(call.data.split("open_edit_plan_")[1])
+    async with async_session_maker() as session:
+        plan = await crud.get_rehab_plan(session, patient_id)
+        if not plan:
+            await call.answer("План не найден.", show_alert=True)
+            return
+        formatted_text = format_rehab_plan_text(plan.exercises_json, plan.nutrition_json)
+        status_ru = "✅ Активен" if plan.status == "active" else "📝 Черновик"
+        text = f"📋 *План реабилитации*\nСтатус: {status_ru}\n\n{formatted_text}"
+        await call.message.edit_text(
+            text,
+            reply_markup=get_edit_plan_kb(patient_id, status=plan.status, show_back_button=True),
             parse_mode="Markdown"
         )
     await call.answer()
@@ -1036,35 +1114,85 @@ async def process_exercise_param(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("edit_nutrition_menu_"))
 async def cb_edit_nutrition_menu(call: CallbackQuery):
     patient_id = int(call.data.split("edit_nutrition_menu_")[1])
+    async with async_session_maker() as session:
+        plan = await crud.get_rehab_plan(session, patient_id)
+        meals = plan.nutrition_json.get("nutrition", {}).get("meals", {}) if plan else None
     await call.message.edit_text(
         "Выберите приём пищи для редактирования:",
-        reply_markup=nutrition_menu_kb(patient_id)
+        reply_markup=nutrition_menu_kb(patient_id, meals)
     )
     await call.answer()
 
 
 # --- ВЫБОР ПРИЁМА ПИЩИ ---
 @router.callback_query(F.data.startswith("edit_meal_"))
-async def cb_edit_meal(call: CallbackQuery, state: FSMContext):
-    # формат: edit_meal_{meal_key}_{patient_id}
-    # meal_key может быть: breakfast, lunch, dinner
-    suffix = call.data[len("edit_meal_"):]          # "breakfast_123"
-    meal_key, raw_id = suffix.rsplit("_", 1)        # "breakfast", "123"
+async def cb_edit_meal(call: CallbackQuery):
+    # edit_meal_food_ обрабатывается отдельным обработчиком cb_edit_meal_food
+    if call.data.startswith("edit_meal_food_"):
+        return
+    suffix = call.data[len("edit_meal_"):]
+    meal_key, raw_id = suffix.rsplit("_", 1)
     patient_id = int(raw_id)
     async with async_session_maker() as session:
         plan = await crud.get_rehab_plan(session, patient_id)
-    if not plan:
-        await call.answer("План не найден.", show_alert=True)
-        return
-    meals = plan.nutrition_json.get("nutrition", {}).get("meals", {})
-    current = meals.get(meal_key, "Не задано")
-    meal_name_ru = MEAL_NAMES_RU.get(meal_key, meal_key)
+        if not plan:
+            await call.answer("План не найден.", show_alert=True)
+            return
+    meal_name = MEAL_NAMES_RU.get(meal_key, meal_key.capitalize())
+    await call.message.edit_text(
+        f"Приём пищи: *{meal_name}*\nВыберите действие:",
+        reply_markup=meal_actions_kb(meal_key, patient_id),
+        parse_mode="Markdown"
+    )
+    await call.answer()
+    
+@router.callback_query(F.data.startswith("edit_meal_food_"))
+async def cb_edit_meal_food(call: CallbackQuery, state: FSMContext):
+    # формат: edit_meal_food_{meal_key}_{patient_id}
+    suffix = call.data[len("edit_meal_food_"):]
+    meal_key, raw_id = suffix.rsplit("_", 1)
+    patient_id = int(raw_id)
+    async with async_session_maker() as session:
+        plan = await crud.get_rehab_plan(session, patient_id)
+        if not plan:
+            await call.answer("План не найден.", show_alert=True)
+            return
+        meals = plan.nutrition_json.get("nutrition", {}).get("meals", {})
+        current = meals.get(meal_key, "Не задано")
     await state.update_data(patient_id=patient_id, meal_key=meal_key)
     await state.set_state(EditPlanFSM.waiting_for_meal)
     await call.message.answer(
-        f"Введите меню для *{meal_name_ru}*.\nСтарое меню: {current}",
-        reply_markup=back_kb(),
-        parse_mode="Markdown"
+        f"Введите новые блюда.\nСтарые блюда: {current}",
+        reply_markup=back_kb()
+    )
+    await call.answer()
+    
+@router.callback_query(F.data.startswith("delete_meal_"))
+async def cb_delete_meal(call: CallbackQuery, state: FSMContext):
+    suffix = call.data[len("delete_meal_"):]
+    meal_key, raw_id = suffix.rsplit("_", 1)
+    patient_id = int(raw_id)
+    async with async_session_maker() as session:
+        plan = await crud.get_rehab_plan(session, patient_id)
+        if not plan:
+            await call.answer("План не найден.", show_alert=True)
+            return
+        meals = plan.nutrition_json.get("nutrition", {}).get("meals", {})
+        if meal_key not in meals:
+            await call.answer("Приём пищи уже удалён.", show_alert=True)
+            return
+        del meals[meal_key]
+        plan.nutrition_json["nutrition"]["meals"] = meals
+        flag_modified(plan, "nutrition_json")
+        await session.commit()
+    await state.clear()
+    await call.message.answer(
+        "✅ Приём пищи успешно удалён.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await call.message.answer(
+        "Выберите приём пищи для редактирования:",
+        reply_markup=nutrition_menu_kb(patient_id, meals)
     )
     await call.answer()
 
@@ -1270,6 +1398,75 @@ async def process_add_exercise_reps(message: Message, state: FSMContext):
         "Выберите упражнение для редактирования:",
         reply_markup=exercises_list_kb(patient_id, updated_exercises)
     )
+    
+@router.callback_query(F.data.startswith("add_meal_"))
+async def cb_add_meal(call: CallbackQuery, state: FSMContext):
+    patient_id = int(call.data.split("add_meal_")[1])
+    await state.update_data(patient_id=patient_id)
+    await state.set_state(EditPlanFSM.add_meal_name)
+    await call.message.answer(
+        "Введите название приёма пищи (только на русском):",
+        reply_markup=back_kb()
+    )
+    await call.answer()
+
+
+@router.message(EditPlanFSM.add_meal_name)
+async def process_add_meal_name(message: Message, state: FSMContext):
+    valid, result = validate_russian_text(message.text)
+    if not valid:
+        await message.answer(result, reply_markup=back_kb())
+        return
+        
+    await state.update_data(new_meal_name=result.lower())
+    await state.set_state(EditPlanFSM.add_meal_food)
+    await message.answer(
+        "Теперь введите блюда для этого приёма пищи (только на русском):",
+        reply_markup=back_kb()
+    )
+
+
+@router.message(EditPlanFSM.add_meal_food)
+async def process_add_meal_food(message: Message, state: FSMContext):
+    valid, result = validate_russian_text(message.text)
+    if not valid:
+        await message.answer(result, reply_markup=back_kb())
+        return
+        
+    data = await state.get_data()
+    patient_id = data.get("patient_id")
+    new_meal_name = data.get("new_meal_name")
+    new_food = result
+    
+    await state.clear()
+    
+    async with async_session_maker() as session:
+        plan = await crud.get_rehab_plan(session, patient_id)
+        if plan:
+            if "nutrition" not in plan.nutrition_json:
+                plan.nutrition_json["nutrition"] = {}
+            if "meals" not in plan.nutrition_json["nutrition"]:
+                plan.nutrition_json["nutrition"]["meals"] = {}
+                
+            plan.nutrition_json["nutrition"]["meals"][new_meal_name] = new_food
+            # Принудительно помечаем поле как измененное для SQLAlchemy
+            flag_modified(plan, "nutrition_json")
+            await session.commit()
+            
+            # Получаем обновленный словарь приемов пищи
+            meals = plan.nutrition_json["nutrition"]["meals"]
+            
+            await message.answer(
+                f"✅ Приём пищи «{new_meal_name.capitalize()}» успешно добавлен.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            await message.answer(
+                "Выберите приём пищи для редактирования:",
+                reply_markup=nutrition_menu_kb(patient_id, meals)
+            )
+        else:
+            await message.answer("План не найден.", reply_markup=ReplyKeyboardRemove())
+            await _send_main_menu(message)
 
 
 # ===========================================================================

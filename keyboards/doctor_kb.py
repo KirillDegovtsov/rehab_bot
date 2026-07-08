@@ -36,10 +36,10 @@ def patient_list_kb(patients) -> InlineKeyboardMarkup:
 
 def patient_card_kb(patient_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="📝 Редактировать данные", callback_data=f"edit_pat_{patient_id}")
-    builder.button(text="📋 Редактировать план",   callback_data=f"view_plan_{patient_id}")
-    builder.button(text="❌ Удалить пациента",      callback_data=f"delete_pat_{patient_id}")
-    builder.button(text="🔙 К списку",             callback_data="back_to_list")
+    builder.button(text="📝 Редактировать данные",         callback_data=f"edit_pat_{patient_id}")
+    builder.button(text="📋 Посмотреть план реабилитации", callback_data=f"view_plan_{patient_id}")
+    builder.button(text="❌ Удалить пациента",             callback_data=f"delete_pat_{patient_id}")
+    builder.button(text="🔙 К списку",                    callback_data="back_to_list")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -102,18 +102,43 @@ def exercise_edit_kb(patient_id: int, exercise_index: int) -> InlineKeyboardMark
     return builder.as_markup()
 
 
-def nutrition_menu_kb(patient_id: int) -> InlineKeyboardMarkup:
-    """Кнопки выбора приёма пищи для редактирования."""
+def nutrition_menu_kb(patient_id: int, meals: dict = None) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="🍳 Завтрак", callback_data=f"edit_meal_breakfast_{patient_id}")
-    builder.button(text="🥗 Обед",    callback_data=f"edit_meal_lunch_{patient_id}")
-    builder.button(text="🍲 Ужин",    callback_data=f"edit_meal_dinner_{patient_id}")
-    builder.button(text="🔙 Назад",   callback_data=f"back_to_plan_{patient_id}")
+    if meals is None:
+        meals = {"breakfast": "", "lunch": "", "dinner": ""}
+    for meal_key in meals:
+        if meal_key == "breakfast":
+            label = "🍳 Завтрак"
+        elif meal_key == "lunch":
+            label = "🥗 Обед"
+        elif meal_key == "dinner":
+            label = "🍲 Ужин"
+        else:
+            label = f"🍽 {meal_key.capitalize()}"
+        builder.button(text=label, callback_data=f"edit_meal_{meal_key}_{patient_id}")
+    builder.button(text="➕ Добавить приём пищи", callback_data=f"add_meal_{patient_id}")
+    builder.button(text="🔙 Назад", callback_data=f"back_to_plan_{patient_id}")
     builder.adjust(1)
     return builder.as_markup()
 
 def confirm_generation_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="🚀 Сгенерировать план", callback_data="confirm_generate_plan")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def meal_actions_kb(meal_key: str, patient_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🗑 Удалить приём пищи",  callback_data=f"delete_meal_{meal_key}_{patient_id}")
+    builder.button(text="✏️ Редактировать блюда", callback_data=f"edit_meal_food_{meal_key}_{patient_id}")
+    builder.button(text="🔙 Назад",               callback_data=f"edit_nutrition_menu_{patient_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def view_plan_kb(patient_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Изменить план", callback_data=f"open_edit_plan_{patient_id}")
+    builder.button(text="🔙 Назад",         callback_data=f"patient_card_{patient_id}")
     builder.adjust(1)
     return builder.as_markup()

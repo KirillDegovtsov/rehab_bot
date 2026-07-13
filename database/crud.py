@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from .models import Doctor, Patient, RehabPlan
+from .models import Doctor, Patient, RehabPlan, MedicationPlan, Admin
 from sqlalchemy.orm.attributes import flag_modified
 from database.models import MedicationPlan  # Добавь к уже существующим импортам моделей
 
@@ -128,3 +128,30 @@ async def update_medications(session: AsyncSession, patient_id: int, new_list: l
     flag_modified(plan, "medications")
     await session.commit()
     return plan
+
+
+async def bootstrap_admin(session: AsyncSession, admin_username: str):
+    username_clean = admin_username.lower().replace('@', '')
+    admin = await session.scalar(select(Admin).where(Admin.username == username_clean))
+    if not admin:
+        admin = Admin(username=username_clean)
+        session.add(admin)
+        await session.commit()
+
+async def get_user_role(session: AsyncSession, username: str) -> str | None:
+    if await session.scalar(select(Admin).where(Admin.username == username)):
+        return 'admin'
+    if await session.scalar(select(Doctor).where(Doctor.username == username)):
+        return 'doctor'
+    if await session.scalar(select(Patient).where(Patient.username == username)):
+        return 'patient'
+    return None
+
+async def add_doctor(session: AsyncSession, username: str, fio: str):
+    doctor = Doctor(username=username, fio=fio)
+    session.add(doctor)
+    await session.commit()
+
+async def get_doctor_by_username(session: AsyncSession, username: str) -> Doctor | None:
+    return await session.scalar(select(Doctor).where(Doctor.username == username))
+

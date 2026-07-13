@@ -1,15 +1,19 @@
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import BigInteger, String, Integer, ForeignKey, JSON
 
-
 class Base(DeclarativeBase):
     pass
 
+class Admin(Base):
+    __tablename__ = 'admins'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String, unique=True, index=True)
 
 class Doctor(Base):
     __tablename__ = 'doctors'
     id: Mapped[int] = mapped_column(primary_key=True)
-    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    username: Mapped[str] = mapped_column(String, unique=True, index=True) # НОВОЕ ПОЛЕ
+    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True, nullable=True) # СТАЛО NULLABLE
     fio: Mapped[str] = mapped_column(String)
 
     patients: Mapped[list["Patient"]] = relationship(back_populates="doctor")

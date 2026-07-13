@@ -370,13 +370,40 @@ async def step_back(message: Message, state: FSMContext):
         EditPlanFSM.waiting_for_sets.state,
         EditPlanFSM.waiting_for_reps.state,
     ):
+        data = await state.get_data()
+        patient_id = data.get("patient_id")
+        exercise_index = data.get("exercise_index")
         await state.clear()
+        
+        async with async_session_maker() as session:
+            plan = await crud.get_rehab_plan(session, patient_id)
+            
         await message.answer(
             "Редактирование отменено.",
             reply_markup=ReplyKeyboardRemove()
         )
-        await _send_main_menu(message)
-        await state.set_state(MenuNavigationFSM.main_menu)
+        
+        if patient_id and plan and exercise_index is not None:
+            try:
+                exercise = plan.exercises_json["exercises"][exercise_index]
+                text = (
+                    f"🏋️ *{exercise['name']}*\n"
+                    f"Подходы: {exercise.get('sets', '—')} | Повторения: {exercise.get('reps', '—')}\n\n"
+                    f"Что хотите изменить?"
+                )
+                await message.answer(
+                    text,
+                    reply_markup=exercise_edit_kb(patient_id, exercise_index),
+                    parse_mode="Markdown"
+                )
+                await state.set_state(MenuNavigationFSM.exercise_edit)
+                await state.update_data(patient_id=patient_id, exercise_index=exercise_index)
+            except (IndexError, KeyError):
+                await _send_main_menu(message)
+                await state.set_state(MenuNavigationFSM.main_menu)
+        else:
+            await _send_main_menu(message)
+            await state.set_state(MenuNavigationFSM.main_menu)
         return
 
     if current_state == EditPlanFSM.add_exercise_name.state:
@@ -1215,48 +1242,60 @@ async def cb_edit_nutrition_menu(call: CallbackQuery, state: FSMContext):  # ←
 
 
 # --- ВЫБОР ПРИЁМА ПИЩИ ---
-@router.callback_query(F.data.startswith("edit_meal_"))
-async def cb_edit_meal(call: CallbackQuery, state: FSMContext):  # ← ИЗМЕНЕНО
-    if call.data.startswith("edit_meal_food_"):
-        return
-    suffix = call.data[len("edit_meal_"):]
+# НОВЫЙ ХЕНДЛЕР: Обработка нажатия кнопки "Редактировать" внутри конкретного приема пищи
+# Важно: он должен находиться ВЫШЕ cb_edit_meal, чтобы перехватывать длинный префикс
+@router.callback_query(F.data.startswith("edit_meal_food_"))
+async def cb_edit_meal_food(call: CallbackQuery, state: FSMContext):
+    # формат call.data: edit_meal_food_{meal_key}_{patient_id}
+    suffix = call.data[len("edit_meal_food_"):]
     meal_key, raw_id = suffix.rsplit("_", 1)
     patient_id = int(raw_id)
+    
     async with async_session_maker() as session:
         plan = await crud.get_rehab_plan(session, patient_id)
         if not plan:
             await call.answer("План не найден.", show_alert=True)
             return
+
+    current_food = plan.nutrition_json.get("nutrition", {}).get("meals", {}).get(meal_key, "—")
     meal_name = MEAL_NAMES_RU.get(meal_key, meal_key.capitalize())
-    await call.message.edit_text(
-        f"Приём пищи: *{meal_name}*\nВыберите действие:",
-        reply_markup=meal_actions_kb(meal_key, patient_id),
+    
+    await state.update_data(
+        patient_id=patient_id, 
+        meal_key=meal_key
+    )
+    await state.set_state(EditPlanFSM.waiting_for_meal)
+    
+    await call.message.answer(
+        f"Введите новое описание для приёма пищи *{meal_name}*.\n"
+        f"Текущее значение:\n_{current_food}_",
+        reply_markup=back_kb(),
         parse_mode="Markdown"
     )
-    await state.set_state(MenuNavigationFSM.meal_actions)              # ← НОВОЕ
-    await state.update_data(patient_id=patient_id, meal_key=meal_key)  # ← НОВОЕ
     await call.answer()
 
 
+# ОБНОВЛЕННЫЙ ХЕНДЛЕР: Обработка выбора конкретного приема пищи из списка
 @router.callback_query(F.data.startswith("edit_meal_"))
-async def cb_edit_meal(call: CallbackQuery):
-    # edit_meal_food_ обрабатывается отдельным обработчиком cb_edit_meal_food
-    if call.data.startswith("edit_meal_food_"):
-        return
+async def cb_edit_meal(call: CallbackQuery, state: FSMContext):
     suffix = call.data[len("edit_meal_"):]
     meal_key, raw_id = suffix.rsplit("_", 1)
     patient_id = int(raw_id)
+    
     async with async_session_maker() as session:
         plan = await crud.get_rehab_plan(session, patient_id)
         if not plan:
             await call.answer("План не найден.", show_alert=True)
             return
+            
     meal_name = MEAL_NAMES_RU.get(meal_key, meal_key.capitalize())
     await call.message.edit_text(
         f"Приём пищи: *{meal_name}*\nВыберите действие:",
         reply_markup=meal_actions_kb(meal_key, patient_id),
         parse_mode="Markdown"
     )
+    await state.set_state(MenuNavigationFSM.meal_actions)              
+    await state.update_data(patient_id=patient_id, meal_key=meal_key)  
     await call.answer()
     
     

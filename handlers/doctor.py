@@ -22,6 +22,9 @@ from keyboards.doctor_kb import (
     confirm_generation_kb,
     meal_actions_kb,
     view_plan_kb,
+    medication_empty_kb,
+    medication_list_kb,
+    medication_card_kb,
 )
 from utils import format_rehab_plan_text
 
@@ -80,6 +83,16 @@ class MenuNavigationFSM(StatesGroup):
     exercise_edit       = State()
     nutrition_menu      = State()
     meal_actions        = State()
+    medication_menu = State()    # просмотр списка лекарств
+    medication_list  = State()   # список лекарств с кнопками
+    medication_card = State()
+    
+class MedicationFSM(StatesGroup):
+    waiting_for_name        = State()   # ввод названия лекарства
+    waiting_for_times       = State()   # ввод кол-ва раз в день
+    waiting_for_indications = State()   # ввод показаний
+    edit_times = State()       # <--- ДОБАВИТЬ ЭТО
+    edit_indications = State()
 
 # ===========================================================================
 # СЛОВАРЬ НАВИГАЦИИ ПО ШАГАМ FSM (для кнопки Назад)
@@ -291,9 +304,174 @@ async def _send_main_menu(message: Message):
     await message.answer("🏠 Главное меню", reply_markup=main_menu_kb())
 
 
+@router.callback_query(F.data.startswith("open_med_"))
+async def cb_open_med_card(call: CallbackQuery, state: FSMContext):
+    parts = call.data.split("_")
+    patient_id, med_index = int(parts[2]), int(parts[3])
+    
+    async with async_session_maker() as session:
+        med_plan = await crud.get_medication_plan(session, patient_id)
+        
+    med = med_plan.medications[med_index]
+    text = (f"💊 *Карточка лекарства*\n\n"
+            f"Название: *{med['name']}*\n"
+            f"Кол-во приемов: {med['times_per_day']} раз/день\n"
+            f"Показания: {med['indications']}\n\n"
+            f"Что хотите изменить?")
+            
+    await state.update_data(patient_id=patient_id, med_index=med_index)
+    await state.set_state(MenuNavigationFSM.medication_card)
+    await call.message.edit_text(text, reply_markup=medication_card_kb(patient_id, med_index), parse_mode="Markdown")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("del_med_"))
+async def cb_del_med(call: CallbackQuery, state: FSMContext):
+    parts = call.data.split("_")
+    patient_id, med_index = int(parts[2]), int(parts[3])
+    
+    async with async_session_maker() as session:
+        med_plan = await crud.get_medication_plan(session, patient_id)
+        med_plan.medications.pop(med_index)
+        await crud.update_medications(session, patient_id, med_plan.medications)
+        
+        if not med_plan.medications:
+            text = "💊 *Медикаментозное лечение*\n\nПациенту ещё не назначено медикаментозное лечение."
+            kb = medication_empty_kb(patient_id)
+            await state.set_state(MenuNavigationFSM.medication_menu)
+        else:
+            text = "🗑 Лекарство удалено.\n\n💊 *Медикаментозное лечение*\n\nВыберите лекарство:"
+            kb = medication_list_kb(patient_id, med_plan.medications)
+            await state.set_state(MenuNavigationFSM.medication_list)
+            
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("edit_med_times_"))
+async def cb_edit_med_times(call: CallbackQuery, state: FSMContext):
+    await state.set_state(MedicationFSM.edit_times)
+    await call.message.answer("Введите новое количество приемов в день (число больше 0):", reply_markup=back_kb())
+    await call.answer()
+
+@router.callback_query(F.data.startswith("edit_med_ind_"))
+async def cb_edit_med_ind(call: CallbackQuery, state: FSMContext):
+    await state.set_state(MedicationFSM.edit_indications)
+    await call.message.answer("Введите новые показания к применению (только на русском языке):", reply_markup=back_kb())
+    await call.answer()
+
+@router.message(MedicationFSM.edit_times, F.text != "🔙 Назад")
+async def process_edit_times(message: Message, state: FSMContext):
+    raw = message.text.strip()
+    if not raw.isdigit() or int(raw) < 1:
+        await message.answer("❌ Некорректное значение. Введите число больше 0.", reply_markup=back_kb())
+        return
+        
+    data = await state.get_data()
+    patient_id, med_index = data["patient_id"], data["med_index"]
+    
+    async with async_session_maker() as session:
+        med_plan = await crud.get_medication_plan(session, patient_id)
+        med_plan.medications[med_index]["times_per_day"] = int(raw)
+        await crud.update_medications(session, patient_id, med_plan.medications)
+        med = med_plan.medications[med_index]
+        
+    text = (f"✅ Успешно!\n\n💊 *Карточка лекарства*\n\nНазвание: *{med['name']}*\n"
+            f"Кол-во приемов: {med['times_per_day']} раз/день\nПоказания: {med['indications']}\n\nЧто хотите изменить?")
+            
+    await state.set_state(MenuNavigationFSM.medication_card)
+    await message.answer("Данные обновлены.", reply_markup=ReplyKeyboardRemove())
+    await message.answer(text, reply_markup=medication_card_kb(patient_id, med_index), parse_mode="Markdown")
+
+@router.message(MedicationFSM.edit_indications, F.text != "🔙 Назад")
+async def process_edit_indications(message: Message, state: FSMContext):
+    valid, result = validate_russian_text(message.text)
+    if not valid:
+        await message.answer(result, reply_markup=back_kb())
+        return
+        
+    data = await state.get_data()
+    patient_id, med_index = data["patient_id"], data["med_index"]
+    
+    async with async_session_maker() as session:
+        med_plan = await crud.get_medication_plan(session, patient_id)
+        med_plan.medications[med_index]["indications"] = result
+        await crud.update_medications(session, patient_id, med_plan.medications)
+        med = med_plan.medications[med_index]
+        
+    text = (f"✅ Успешно!\n\n💊 *Карточка лекарства*\n\nНазвание: *{med['name']}*\n"
+            f"Кол-во приемов: {med['times_per_day']} раз/день\nПоказания: {med['indications']}\n\nЧто хотите изменить?")
+            
+    await state.set_state(MenuNavigationFSM.medication_card)
+    await message.answer("Данные обновлены.", reply_markup=ReplyKeyboardRemove())
+    await message.answer(text, reply_markup=medication_card_kb(patient_id, med_index), parse_mode="Markdown")
+
+
 @router.message(F.text == "🔙 Назад")
 async def step_back(message: Message, state: FSMContext):
     current_state = await state.get_state()
+    
+        # === БЛОК МЕДИКАМЕНТОВ ===
+    if current_state == MedicationFSM.waiting_for_name.state:
+        data = await state.get_data()
+        patient_id = data.get("patient_id")
+        await state.clear()
+        await message.answer("Действие отменено.", reply_markup=ReplyKeyboardRemove())
+        
+        if patient_id:
+            await state.update_data(patient_id=patient_id)
+            async with async_session_maker() as session:
+                med_plan = await crud.get_medication_plan(session, patient_id)
+            
+            if not med_plan or not med_plan.medications:
+                await message.answer("💊 *Медикаментозное лечение*\n\nПациенту ещё не назначено медикаментозное лечение.", 
+                                     reply_markup=medication_empty_kb(patient_id), parse_mode="Markdown")
+                await state.set_state(MenuNavigationFSM.medication_menu)
+            else:
+                await message.answer("💊 *Медикаментозное лечение*\n\nВыберите лекарство:", 
+                                     reply_markup=medication_list_kb(patient_id, med_plan.medications), parse_mode="Markdown")
+                await state.set_state(MenuNavigationFSM.medication_list)
+        else:
+            await _send_main_menu(message)
+            await state.set_state(MenuNavigationFSM.main_menu)
+        return
+
+    if current_state == MedicationFSM.waiting_for_times.state:
+        await state.set_state(MedicationFSM.waiting_for_name)
+        await message.answer("Введите название лекарства (только на русском языке):", reply_markup=back_kb())
+        return
+
+    # Исправляет баги 1 и 6:
+    if current_state == MedicationFSM.waiting_for_indications.state:
+        await state.set_state(MedicationFSM.waiting_for_times)
+        await message.answer("Сколько раз в день принимать лекарство? Введите число (больше 0):", reply_markup=back_kb())
+        return
+
+    if current_state in (MedicationFSM.edit_times.state, MedicationFSM.edit_indications.state):
+        data = await state.get_data()
+        patient_id, med_index = data["patient_id"], data["med_index"]
+        await state.clear()
+        await state.update_data(patient_id=patient_id, med_index=med_index)
+        
+        async with async_session_maker() as session:
+            med_plan = await crud.get_medication_plan(session, patient_id)
+            
+        med = med_plan.medications[med_index]
+        text = (f"💊 *Карточка лекарства*\n\nНазвание: *{med['name']}*\n"
+                f"Кол-во приемов: {med['times_per_day']} раз/день\nПоказания: {med['indications']}\n\nЧто хотите изменить?")
+        
+        await state.set_state(MenuNavigationFSM.medication_card)
+        await message.answer("Изменение отменено.", reply_markup=ReplyKeyboardRemove())
+        await message.answer(text, reply_markup=medication_card_kb(patient_id, med_index), parse_mode="Markdown")
+        return
+    # === КОНЕЦ БЛОКА МЕДИКАМЕНТОВ ===
+
+    # Назад из ввода кол-ва раз → ввод названия
+    if current_state == MedicationFSM.waiting_for_times.state:
+        await state.set_state(MedicationFSM.waiting_for_name)
+        await message.answer(
+            "Введите название лекарства (только на русском языке):",
+            reply_markup=back_kb()
+        )
+        return
 
     if current_state == EditPatientFieldFSM.waiting_value.state:
         data = await state.get_data()
@@ -1273,6 +1451,139 @@ async def cb_edit_meal_food(call: CallbackQuery, state: FSMContext):
         parse_mode="Markdown"
     )
     await call.answer()
+    
+
+
+
+# Добавь эти хендлеры:
+@router.callback_query(F.data.startswith("medication_menu_"))
+async def cb_medication_menu(call: CallbackQuery, state: FSMContext):
+    patient_id = int(call.data.split("medication_menu_")[1])
+    async with async_session_maker() as session:
+        med_plan = await crud.get_medication_plan(session, patient_id)
+
+    await state.update_data(patient_id=patient_id)
+
+    if not med_plan or not med_plan.medications:
+        await call.message.edit_text(
+            "💊 *Медикаментозное лечение*\n\nПациенту ещё не назначено медикаментозное лечение.",
+            reply_markup=medication_empty_kb(patient_id),
+            parse_mode="Markdown"
+        )
+        await state.set_state(MenuNavigationFSM.medication_menu)
+    else:
+        text = "💊 *Медикаментозное лечение*\n\nВыберите лекарство:"
+        await call.message.edit_text(
+            text,
+            reply_markup=medication_list_kb(patient_id, med_plan.medications),
+            parse_mode="Markdown"
+        )
+        await state.set_state(MenuNavigationFSM.medication_list)
+    await call.answer()
+
+@router.callback_query(F.data.startswith("add_medication_"))
+async def cb_add_medication_start(call: CallbackQuery, state: FSMContext):
+    patient_id = int(call.data.split("add_medication_")[1])
+    await state.update_data(patient_id=patient_id)
+    await state.set_state(MedicationFSM.waiting_for_name)
+    await call.message.answer(
+        "Введите название лекарства (только на русском языке):",
+        reply_markup=back_kb()
+    )
+    await call.answer()
+
+@router.message(MedicationFSM.waiting_for_name, F.text != "🔙 Назад")
+async def process_medication_name(message: Message, state: FSMContext):
+    valid, result = validate_russian_text(message.text)
+    if not valid:
+        await message.answer(result, reply_markup=back_kb())
+        return
+    await state.update_data(med_name=result)
+    await state.set_state(MedicationFSM.waiting_for_times)
+    await message.answer(
+        "Сколько раз в день принимать лекарство? Введите число (больше 0):",
+        reply_markup=back_kb()
+    )
+
+@router.message(MedicationFSM.waiting_for_times, F.text != "🔙 Назад")
+async def process_medication_times(message: Message, state: FSMContext):
+    raw = message.text.strip()
+    if not raw.isdigit() or int(raw) < 1:
+        await message.answer(
+            "❌ Некорректное значение. Введите целое число больше 0. Повторите ввод:",
+            reply_markup=back_kb()
+        )
+        return
+    await state.update_data(med_times=int(raw))
+    await state.set_state(MedicationFSM.waiting_for_indications)
+    await message.answer(
+        "Введите показания к применению (только на русском языке):",
+        reply_markup=back_kb()
+    )
+
+@router.message(MedicationFSM.waiting_for_indications, F.text != "🔙 Назад")
+async def process_medication_indications(message: Message, state: FSMContext):
+    valid, result = validate_russian_text(message.text)
+    if not valid:
+        await message.answer(result, reply_markup=back_kb())
+        return
+
+    data = await state.get_data()
+    patient_id  = data["patient_id"]
+    med_name    = data["med_name"]
+    med_times   = data["med_times"]
+
+    medication = {
+        "name": med_name,
+        "times_per_day": med_times,
+        "indications": result
+    }
+
+    async with async_session_maker() as session:
+        med_plan = await crud.add_medication(session, patient_id, medication)
+
+    await state.clear()
+    await state.update_data(patient_id=patient_id)
+    await state.set_state(MenuNavigationFSM.medication_list)
+
+    meds = med_plan.medications
+    text = "✅ Лекарство добавлено!\n\n💊 *Медикаментозное лечение*\n\nВыберите лекарство:"
+    await message.answer(
+        text,
+        reply_markup=medication_list_kb(patient_id, med_plan.medications),
+        parse_mode="Markdown"
+    )
+
+@router.message(MenuNavigationFSM.medication_menu)
+async def medication_menu_unknown(message: Message, state: FSMContext):
+    if message.text == "🔙 Назад": return
+    data = await state.get_data()
+    patient_id = data.get("patient_id")
+    await message.answer("⚠️ Пожалуйста, воспользуйтесь кнопками ниже.", reply_markup=medication_empty_kb(patient_id))
+
+@router.message(MenuNavigationFSM.medication_list)
+async def medication_list_unknown(message: Message, state: FSMContext):
+    if message.text == "🔙 Назад": return
+    data = await state.get_data()
+    patient_id = data.get("patient_id")
+    async with async_session_maker() as session:
+        med_plan = await crud.get_medication_plan(session, patient_id)
+    await message.answer("⚠️ Пожалуйста, воспользуйтесь кнопками ниже.", reply_markup=medication_list_kb(patient_id, med_plan.medications))
+    
+@router.message(MenuNavigationFSM.medication_card)
+async def medication_card_unknown(message: Message, state: FSMContext):
+    # Если вдруг нажали какую-то старую текстовую кнопку назад
+    if message.text == "🔙 Назад": 
+        return
+    
+    data = await state.get_data()
+    patient_id = data.get("patient_id")
+    med_index = data.get("med_index")
+    
+    await message.answer(
+        "⚠️ Пожалуйста, воспользуйтесь кнопками ниже.", 
+        reply_markup=medication_card_kb(patient_id, med_index)
+    )
 
 
 # ОБНОВЛЕННЫЙ ХЕНДЛЕР: Обработка выбора конкретного приема пищи из списка

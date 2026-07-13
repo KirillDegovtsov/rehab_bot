@@ -36,10 +36,11 @@ def patient_list_kb(patients) -> InlineKeyboardMarkup:
 
 def patient_card_kb(patient_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="📝 Редактировать данные",          callback_data=f"edit_pat_{patient_id}")
-    builder.button(text="📋 Посмотреть план реабилитации",  callback_data=f"view_plan_{patient_id}")
-    builder.button(text="❌ Удалить пациента",              callback_data=f"delete_pat_{patient_id}")
-    builder.button(text="🔙 К списку",                     callback_data="back_to_list")
+    builder.button(text="📝 Редактировать данные",        callback_data=f"edit_pat_{patient_id}")
+    builder.button(text="📋 Посмотреть план реабилитации", callback_data=f"view_plan_{patient_id}")
+    builder.button(text="💊 Медикаментозное лечение",     callback_data=f"medication_menu_{patient_id}")
+    builder.button(text="❌ Удалить пациента",             callback_data=f"delete_pat_{patient_id}")
+    builder.button(text="🔙 К списку",                    callback_data="back_to_list")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -138,5 +139,35 @@ def view_plan_kb(patient_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="✏️ Изменить план", callback_data=f"open_edit_plan_{patient_id}")
     builder.button(text="🔙 Назад",         callback_data=f"patient_card_{patient_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def medication_empty_kb(patient_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💊 Назначить медикаментозное лечение", callback_data=f"add_medication_{patient_id}")
+    builder.button(text="🔙 Назад",                             callback_data=f"patient_card_{patient_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+# Замени эту функцию (добавлен индекс для карточки):
+def medication_list_kb(patient_id: int, medications: list) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for i, med in enumerate(medications):
+        # Здесь меняем noop_med на open_med с передачей индекса (i)
+        builder.button(text=f"💊 {med['name']}", callback_data=f"open_med_{patient_id}_{i}")
+    builder.button(text="➕ Добавить лекарство", callback_data=f"add_medication_{patient_id}")
+    builder.button(text="🔙 Назад",              callback_data=f"patient_card_{patient_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+# Добавь эту функцию (клавиатура карточки):
+def medication_card_kb(patient_id: int, med_index: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⏱ Изменить кол-во приемов", callback_data=f"edit_med_times_{patient_id}_{med_index}")
+    builder.button(text="📝 Изменить показания",      callback_data=f"edit_med_ind_{patient_id}_{med_index}")
+    builder.button(text="❌ Удалить",                 callback_data=f"del_med_{patient_id}_{med_index}")
+    # Возврат перенаправляет обратно в меню, которое само покажет список:
+    builder.button(text="🔙 Назад",                 callback_data=f"medication_menu_{patient_id}")
     builder.adjust(1)
     return builder.as_markup()

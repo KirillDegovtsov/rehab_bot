@@ -39,6 +39,12 @@ class Patient(Base):
         uselist=False,
         cascade="all, delete-orphan"
     )
+    
+    medication_plan: Mapped["MedicationPlan"] = relationship(
+        back_populates="patient",
+        uselist=False,
+        cascade="all, delete-orphan"
+    )
 
 
 class RehabPlan(Base):
@@ -50,3 +56,16 @@ class RehabPlan(Base):
     status: Mapped[str] = mapped_column(String, default='draft')
 
     patient: Mapped["Patient"] = relationship(back_populates="rehab_plan")
+    
+    
+class MedicationPlan(Base):
+    __tablename__ = 'medication_plans'
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    patient_id: Mapped[int] = mapped_column(ForeignKey('patients.id'), unique=True)
+
+    # medications хранит список объектов:
+    # [{"name": str, "times_per_day": int, "indications": str}, ...]
+    medications: Mapped[list] = mapped_column(JSON, default=list)
+
+    patient: Mapped["Patient"] = relationship(back_populates="medication_plan")

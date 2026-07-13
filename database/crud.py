@@ -1,6 +1,8 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from .models import Doctor, Patient, RehabPlan
+from sqlalchemy.orm.attributes import flag_modified
+from database.models import MedicationPlan  # Добавь к уже существующим импортам моделей
 
 
 async def get_or_create_doctor(session: AsyncSession, tg_id: int, fio: str) -> Doctor:
@@ -96,3 +98,33 @@ async def get_patient_by_username(
     stmt = select(Patient).where(Patient.username == username)
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
+
+async def get_medication_plan(session: AsyncSession, patient_id: int):
+    stmt = select(MedicationPlan).where(MedicationPlan.patient_id == patient_id)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+async def create_medication_plan(session: AsyncSession, patient_id: int) -> MedicationPlan:
+    plan = MedicationPlan(patient_id=patient_id, medications=[])
+    session.add(plan)
+    await session.commit()
+    await session.refresh(plan)
+    return plan
+
+async def add_medication(session: AsyncSession, patient_id: int, medication: dict) -> MedicationPlan:
+    plan = await get_medication_plan(session, patient_id)
+    if not plan:
+        plan = await create_medication_plan(session, patient_id)
+    new_list = list(plan.medications) + [medication]
+    plan.medications = new_list
+    flag_modified(plan, "medications")
+    await session.commit()
+    await session.refresh(plan)
+    return plan
+
+async def update_medications(session: AsyncSession, patient_id: int, new_list: list) -> MedicationPlan:
+    plan = await get_medication_plan(session, patient_id)
+    plan.medications = new_list
+    flag_modified(plan, "medications")
+    await session.commit()
+    return plan

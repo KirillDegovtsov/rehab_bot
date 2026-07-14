@@ -671,6 +671,14 @@ async def cmd_start_doctor(message: Message, state: FSMContext, username: str):
             fio=message.from_user.full_name,
             username=username,  # приходит из AuthMiddleware через data['username']
         )
+    
+    # НОВЫЙ БЛОК: Отправка приветствия и главного меню после успешной авторизации
+    await message.answer(
+        "👨‍⚕️ <b>Панель управления врача</b>\n\n"
+        "Добро пожаловать! Здесь вы можете управлять списком своих пациентов, "
+        "а также создавать и редактировать их планы реабилитации.",
+        reply_markup=main_menu_kb()
+    )
 
 
 @router.callback_query(F.data == "menu_add_patient")
@@ -685,25 +693,27 @@ async def cb_add_patient(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data == "menu_patients_list")
-async def cb_patients_list(call: CallbackQuery, state: FSMContext):  # ← ИЗМЕНЕНО
+async def cb_patients_list(call: CallbackQuery, state: FSMContext, username: str):  # ← ДОБАВЛЕН username
     async with async_session_maker() as session:
         doctor = await crud.get_or_create_doctor(
-            session, call.from_user.id, call.from_user.full_name
+            session, call.from_user.id, call.from_user.full_name, username  # ← ДОБАВЛЕН username
         )
         patients = await crud.get_patients_by_doctor(session, doctor.id)
+        
     if not patients:
         await call.message.edit_text(
             "Список пациентов пуст.",
             reply_markup=main_menu_kb()
         )
-        await state.set_state(MenuNavigationFSM.main_menu)  # ← НОВОЕ
+        await state.set_state(MenuNavigationFSM.main_menu)
         await call.answer()
         return
+        
     await call.message.edit_text(
         "Ваши пациенты:",
         reply_markup=patient_list_kb(patients)
     )
-    await state.set_state(MenuNavigationFSM.patient_list)  # ← НОВОЕ
+    await state.set_state(MenuNavigationFSM.patient_list)
     await call.answer()
 
 
@@ -888,8 +898,8 @@ async def process_health_status(message: Message, state: FSMContext):
     await message.answer(summary, reply_markup=back_kb(), parse_mode="Markdown")
     await message.answer("👇 Подтвердите:", reply_markup=confirm_generation_kb())
     
-@router.callback_query(F.data == "confirm_generate_plan")
-async def cb_confirm_generate_plan(call: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "confirm_generate_plan") # Внимание на декоратор, он мог называться у тебя по-разному в этом месте
+async def cb_confirm_generate_plan(call: CallbackQuery, state: FSMContext, username: str): # ← ДОБАВЛЕН username
     data = await state.get_data()
     await state.clear()
 
@@ -908,8 +918,9 @@ async def cb_confirm_generate_plan(call: CallbackQuery, state: FSMContext):
 
     async with async_session_maker() as session:
         doctor = await crud.get_or_create_doctor(
-            session, call.from_user.id, call.from_user.full_name
+            session, call.from_user.id, call.from_user.full_name, username  # ← ДОБАВЛЕН username
         )
+        # Остальной код этой функции остается без изменений...
         patient = await crud.create_patient(session, doctor.id, data)
         try:
             draft = await gigachat_client.generate_draft_plan(data)
@@ -956,10 +967,10 @@ async def confirm_generation_invalid_input(message: Message, state: FSMContext):
 # ===========================================================================
 
 @router.callback_query(F.data == "back_to_list")
-async def cb_back_to_list(call: CallbackQuery, state: FSMContext):  # ← ИЗМЕНЕНО
+async def cb_back_to_list(call: CallbackQuery, state: FSMContext, username: str):  # ← ДОБАВЛЕН username
     async with async_session_maker() as session:
         doctor = await crud.get_or_create_doctor(
-            session, call.from_user.id, call.from_user.full_name
+            session, call.from_user.id, call.from_user.full_name, username  # ← ДОБАВЛЕН username
         )
         patients = await crud.get_patients_by_doctor(session, doctor.id)
     if not patients:
@@ -967,14 +978,14 @@ async def cb_back_to_list(call: CallbackQuery, state: FSMContext):  # ← ИЗМ
             "Список пациентов пуст.",
             reply_markup=main_menu_kb()
         )
-        await state.set_state(MenuNavigationFSM.main_menu)  # ← НОВОЕ
+        await state.set_state(MenuNavigationFSM.main_menu)
         await call.answer()
         return
     await call.message.edit_text(
         "Ваши пациенты:",
         reply_markup=patient_list_kb(patients)
     )
-    await state.set_state(MenuNavigationFSM.patient_list)  # ← НОВОЕ
+    await state.set_state(MenuNavigationFSM.patient_list)
     await call.answer()
 
 
@@ -1001,17 +1012,18 @@ async def show_patient_card(call: CallbackQuery, state: FSMContext):  # ← ИЗ
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("delete_pat_"))
-async def delete_patient_handler(call: CallbackQuery):
-    patient_id = int(call.data.split("_")[2])
+@router.callback_query(F.data.startswith("delete_pat_")) # ← ИЗМЕНЕНО: delete_pat_ вместо delete_patient_
+async def delete_patient_handler(call: CallbackQuery, state: FSMContext):
+    # Разделяем строку, чтобы достать ID. Строка "delete_pat_123" -> ["delete", "pat", "123"]
+    # Значит индекс ID теперь 2.
+    patient_id = int(call.data.split("_")[2]) 
+    
     async with async_session_maker() as session:
-        # Читаем doctor_id ДО удаления, пока пациент ещё есть в БД
         patient = await crud.get_patient(session, patient_id)
         doctor_id = patient.doctor_id if patient else None
 
         await crud.delete_patient(session, patient_id)
 
-        # Получаем обновлённый список пациентов этого врача
         patients = await crud.get_patients_by_doctor(session, doctor_id) if doctor_id else []
 
     if patients:
@@ -1019,11 +1031,14 @@ async def delete_patient_handler(call: CallbackQuery):
             "✅ Пациент и его план успешно удалены.\n\nВыберите пациента из списка ниже:",
             reply_markup=patient_list_kb(patients)
         )
+        await state.set_state(MenuNavigationFSM.patient_list)
     else:
         await call.message.edit_text(
             "✅ Пациент и его план успешно удалены. Список пациентов пуст.",
             reply_markup=main_menu_kb()
         )
+        await state.set_state(MenuNavigationFSM.main_menu)
+        
     await call.answer()
 
 # ===========================================================================
@@ -1386,13 +1401,24 @@ async def process_exercise_param(message: Message, state: FSMContext):
         flag_modified(plan, "exercises_json")
         await session.commit()
         await session.refresh(plan)
-        formatted_text = format_rehab_plan_text(plan.exercises_json, plan.nutrition_json)
+        
+        # === ИЗМЕНЕНИЯ ЗДЕСЬ ===
         await message.answer("✅ Значение обновлено.", reply_markup=ReplyKeyboardRemove())
+        
+        # Возвращаем пользователя обратно в карточку редактирования конкретного упражнения
         await message.answer(
-            f"📋 *Обновлённый план*\n\n{formatted_text}",
-            reply_markup=get_edit_plan_kb(patient_id, status=plan.status, show_back=show_back),  # ← изменено
-            parse_mode="Markdown"
+            "Что хотите изменить?",
+            reply_markup=exercise_edit_kb(patient_id, exercise_index)
         )
+        
+        # Устанавливаем правильное состояние FSM и сохраняем нужные данные
+        await state.set_state(MenuNavigationFSM.exercise_edit)
+        await state.update_data(
+            patient_id=patient_id, 
+            exercise_index=exercise_index,
+            show_back_flag=show_back # на случай если он захочет вернуться
+        )
+        # =======================
 
 
 # --- МЕНЮ РЕДАКТИРОВАНИЯ ПИТАНИЯ ---
@@ -1979,7 +2005,7 @@ async def process_approve(call: CallbackQuery, bot: Bot):
     
     
 @router.message()
-async def unknown_message(message: Message, state: FSMContext):
+async def unknown_message(message: Message, state: FSMContext, username: str): # ← ДОБАВЛЕН username
     current_state = await state.get_state()
     data = await state.get_data()
 
@@ -1993,7 +2019,7 @@ async def unknown_message(message: Message, state: FSMContext):
     if current_state == MenuNavigationFSM.patient_list.state:
         async with async_session_maker() as session:
             doctor = await crud.get_or_create_doctor(
-                session, message.from_user.id, message.from_user.full_name
+                session, message.from_user.id, message.from_user.full_name, username  # ← ДОБАВЛЕН username
             )
             patients = await crud.get_patients_by_doctor(session, doctor.id)
         await message.answer(

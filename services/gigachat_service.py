@@ -35,7 +35,7 @@ class GigaChatService:
                 logging.error(f"GigaChat Connection Error: {e}")
                 raise Exception(f"Нет связи с GigaChat: {e}")
 
-    async def generate_draft_plan(self, patient_data: dict) -> dict:
+    async def generate_draft_plan(self, patient_data: dict, max_retries: int = 3) -> dict:
         if not self.token:
             await self._update_token()
 
@@ -43,7 +43,7 @@ class GigaChatService:
             f"Создай черновой план реабилитации для пациента.\n"
             f"Пациент: {patient_data}\n"
             f"Требование: Ответь СТРОГО в формате JSON без markdown и прочего текста.\n"
-            f"Структура JSON: {{\"exercises\": [{{\"name\": \"название\", \"description\": \"как делать\", \"sets\": 3, \"reps\": 10}}], \"nutrition\": {{\"description\": \"общее описание диеты\", \"meals\": {{\"breakfast\": \"...\", \"lunch\": \"...\"}}}}}}"
+            f"Структура JSON: {{\"exercises\": [{{\"name\": \"название\", \"description\": \"как делать\", \"sets\": 3, \"reps\": 10}}], \"nutrition\": {{\"description\": \"общее описание диеты\", \"meals\": {{\"breakfast\": \"...\", \"lunch\": \"...\"}} }}}}"
         )
 
         headers = {
@@ -60,28 +60,34 @@ class GigaChatService:
 
         connector = aiohttp.TCPConnector(verify_ssl=False)
         async with aiohttp.ClientSession(connector=connector, timeout=self.timeout) as session:
-            try:
-                async with session.post(self.chat_url, headers=headers, json=payload) as resp:
-                    if resp.status == 401:
-                        await self._update_token()
-                        return await self.generate_draft_plan(patient_data)
-                    
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        logging.error(f"GigaChat API Error: {error_text}")
-                        raise Exception(f"Ошибка API (Код {resp.status})")
+            for attempt in range(max_retries):
+                try:
+                    async with session.post(self.chat_url, headers=headers, json=payload) as resp:
+                        if resp.status == 401:
+                            await self._update_token()
+                            headers['Authorization'] = f'Bearer {self.token}'
+                            continue 
+                        
+                        if resp.status != 200:
+                            error_text = await resp.text()
+                            logging.error(f"GigaChat API Error: {error_text}")
+                            raise Exception(f"Ошибка API (Код {resp.status})")
 
-                    result = await resp.json()
-                    content = result['choices'][0]['message']['content']
-                    
-                    try:
-                        clean_json = content.replace("```json", "").replace("```", "").strip()
-                        return json.loads(clean_json)
-                    except json.JSONDecodeError:
-                        logging.error(f"GigaChat Parsing Error. Raw content: {content}")
-                        return {"exercises": [{"name": "Ошибка", "description": "Сбой парсинга ИИ", "sets": "-", "reps": "-"}], "nutrition": {"description": content}}
-            except Exception as e:
-                logging.error(f"GigaChat Generation Error: {e}")
-                raise Exception(f"Ошибка генерации: {e}")
+                        result = await resp.json()
+                        content = result['choices'][0]['message']['content']
+                        
+                        try:
+                            clean_json = content.replace("```json", "").replace("```", "").strip()
+                            return json.loads(clean_json)
+                        except json.JSONDecodeError:
+                            logging.error(f"GigaChat Parsing Error on attempt {attempt + 1}. Raw content: {content}")
+                            if attempt == max_retries - 1:
+                                return {"exercises": [{"name": "Ошибка", "description": "Сбой парсинга ИИ", "sets": "-", "reps": "-"}], "nutrition": {"description": content}}
+                            continue 
+                except Exception as e:
+                    logging.error(f"GigaChat Generation Error on attempt {attempt + 1}: {e}")
+                    if attempt == max_retries - 1:
+                        raise Exception(f"Ошибка генерации после {max_retries} попыток: {e}")
 
+# ВОТ ЭТА СТРОЧКА ВАЖНА — ОНА ЭКСПОРТИРУЕТСЯ В ДРУГИЕ ФАЙЛЫ
 gigachat_client = GigaChatService()

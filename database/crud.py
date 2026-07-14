@@ -5,6 +5,18 @@ from sqlalchemy.orm.attributes import flag_modified
 from database.models import MedicationPlan  # Добавь к уже существующим импортам моделей
 from sqlalchemy.exc import IntegrityError  # добавить в импорты
 
+import logging
+from datetime import time
+from typing import Optional, Sequence, Dict
+
+from sqlalchemy import update, delete
+from sqlalchemy.orm import selectinload
+from sqlalchemy.exc import SQLAlchemyError
+
+from database.models import UserReminder, PainLog, MealLog, WorkoutLog
+
+logger = logging.getLogger(__name__)
+
 
 async def get_or_create_doctor(
     session: AsyncSession, tg_id: int, fio: str, username: str
@@ -170,14 +182,23 @@ async def bootstrap_admin(session: AsyncSession, admin_username: str):
         session.add(admin)
         await session.commit()
 
-async def get_user_role(session: AsyncSession, username: str) -> str | None:
-    username = username.strip().lower().replace('@', '')  # добавить эту строку вверху
-    if await session.scalar(select(Admin).where(Admin.username == username)):
-        return 'admin'
-    if await session.scalar(select(Doctor).where(Doctor.username == username)):
-        return 'doctor'
-    if await session.scalar(select(Patient).where(Patient.username == username)):
-        return 'patient'
+# --- ОБНОВИТЬ: добавить поиск по tg_id в get_user_role ---
+# В текущей версии используется telegram_id — меняем на tg_id везде
+
+async def get_user_role(session: AsyncSession, tg_id: int) -> Optional[str]:
+    """Определение роли пользователя по tg_id"""
+    admin = await session.scalar(select(Admin).where(Admin.tg_id == tg_id))
+    if admin:
+        return "admin"
+    
+    doctor = await session.scalar(select(Doctor).where(Doctor.tg_id == tg_id))
+    if doctor:
+        return "doctor"
+    
+    patient = await session.scalar(select(Patient).where(Patient.tg_id == tg_id))
+    if patient:
+        return "patient"
+    
     return None
 
 async def add_doctor(session: AsyncSession, username: str, fio: str):
@@ -245,3 +266,289 @@ async def update_doctor_field(session: AsyncSession, doctor_id: int, field: str,
         else:
             setattr(doctor, field, new_value)
         await session.commit()
+        
+
+
+# ================================================================
+# ПАЦИЕНТ: Онбординг и профиль
+# ================================================================
+
+async def get_patient_by_tg_id(session: AsyncSession, tg_id: int) -> Optional[Patient]:
+    """
+    Получение пациента по Telegram ID.
+    Используется при каждом входе пациента для авторизации.
+    """
+    try:
+        return await session.scalar(select(Patient).where(Patient.tg_id == tg_id))
+    except SQLAlchemyError as e:
+        logger.error(f"[get_patient_by_tg_id] tg_id={tg_id}: {e}")
+        return None
+
+
+async def update_patient_tg_id(session: AsyncSession, patient_id: int, tg_id: int) -> bool:
+    """
+    Привязка tg_id к профилю пациента.
+    Вызывается один раз — когда пациент впервые нажимает /start,
+    а врач уже добавил его в систему по username.
+    """
+    try:
+        await session.execute(
+            update(Patient)
+            .where(Patient.id == patient_id)
+            .values(tg_id=tg_id)
+        )
+        await session.commit()
+        return True
+    except SQLAlchemyError as e:
+        await session.rollback()
+        logger.error(f"[update_patient_tg_id] patient_id={patient_id}: {e}")
+        return False
+
+
+async def update_patient_onboarding_data(
+    session: AsyncSession,
+    patient_id: int,
+    name: str,
+    mobility: str
+) -> bool:
+    """
+    Сохранение данных после прохождения онбординга:
+    имя и уровень мобильности.
+    Флагом завершения онбординга служит наличие записи в pain_logs.
+    """
+    try:
+        await session.execute(
+            update(Patient)
+            .where(Patient.id == patient_id)
+            .values(name=name, mobility=mobility)
+        )
+        await session.commit()
+        return True
+    except SQLAlchemyError as e:
+        await session.rollback()
+        logger.error(f"[update_patient_onboarding_data] patient_id={patient_id}: {e}")
+        return False
+
+
+async def get_patient_full_profile(session: AsyncSession, patient_id: int) -> Optional[Patient]:
+    """
+    Получение пациента вместе со всеми его логами и напоминаниями.
+    Используется в RAG-ассистенте для формирования контекста.
+    selectinload — оптимальный метод для async SQLAlchemy 2.0,
+    избегает проблем N+1 и lazy loading в async контексте.
+    """
+    try:
+        stmt = (
+            select(Patient)
+            .where(Patient.id == patient_id)
+            .options(
+                selectinload(Patient.reminders),
+                selectinload(Patient.pain_logs),
+                selectinload(Patient.meal_logs),
+                selectinload(Patient.workout_logs),
+            )
+        )
+        return await session.scalar(stmt)
+    except SQLAlchemyError as e:
+        logger.error(f"[get_patient_full_profile] patient_id={patient_id}: {e}")
+        return None
+
+
+# ================================================================
+# НАПОМИНАНИЯ (UserReminder)
+# ================================================================
+
+async def create_reminder(
+    session: AsyncSession,
+    patient_id: int,
+    text: str,
+    reminder_time: time
+) -> Optional[UserReminder]:
+    try:
+        reminder = UserReminder(patient_id=patient_id, text=text, reminder_time=reminder_time)
+        session.add(reminder)
+        await session.commit()
+        await session.refresh(reminder)
+        return reminder
+    except SQLAlchemyError as e:
+        await session.rollback()
+        logger.error(f"[create_reminder] patient_id={patient_id}: {e}")
+        return None
+
+
+async def get_active_reminders(session: AsyncSession, patient_id: int) -> Sequence[UserReminder]:
+    try:
+        stmt = (
+            select(UserReminder)
+            .where(
+                UserReminder.patient_id == patient_id,
+                UserReminder.is_active == True
+            )
+            .order_by(UserReminder.reminder_time)
+        )
+        result = await session.execute(stmt)
+        return result.scalars().all()
+    except SQLAlchemyError as e:
+        logger.error(f"[get_active_reminders] patient_id={patient_id}: {e}")
+        return []
+
+
+async def deactivate_reminder(session: AsyncSession, reminder_id: int) -> bool:
+    """
+    Деактивация напоминания (soft delete).
+    Предпочтительнее физического удаления — сохраняется история.
+    """
+    try:
+        await session.execute(
+            update(UserReminder)
+            .where(UserReminder.id == reminder_id)
+            .values(is_active=False)
+        )
+        await session.commit()
+        return True
+    except SQLAlchemyError as e:
+        await session.rollback()
+        logger.error(f"[deactivate_reminder] reminder_id={reminder_id}: {e}")
+        return False
+
+
+async def delete_reminder(session: AsyncSession, reminder_id: int) -> bool:
+    """Физическое удаление напоминания (например, по запросу пациента)"""
+    try:
+        await session.execute(delete(UserReminder).where(UserReminder.id == reminder_id))
+        await session.commit()
+        return True
+    except SQLAlchemyError as e:
+        await session.rollback()
+        logger.error(f"[delete_reminder] reminder_id={reminder_id}: {e}")
+        return False
+
+
+# ================================================================
+# ЛОГИ БОЛИ (PainLog)
+# ================================================================
+
+async def add_pain_log(session: AsyncSession, patient_id: int, pain_level: int) -> Optional[PainLog]:
+    try:
+        log = PainLog(patient_id=patient_id, pain_level=pain_level)
+        session.add(log)
+        await session.commit()
+        await session.refresh(log)
+        return log
+    except SQLAlchemyError as e:
+        await session.rollback()
+        logger.error(f"[add_pain_log] patient_id={patient_id}: {e}")
+        return None
+
+
+async def get_pain_logs(session: AsyncSession, patient_id: int, limit: int = 7) -> Sequence[PainLog]:
+    """Последние N записей боли. Используется для отображения прогресса."""
+    try:
+        stmt = (
+            select(PainLog)
+            .where(PainLog.patient_id == patient_id)
+            .order_by(PainLog.created_at.desc())
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        return result.scalars().all()
+    except SQLAlchemyError as e:
+        logger.error(f"[get_pain_logs] patient_id={patient_id}: {e}")
+        return []
+
+
+async def has_pain_log(session: AsyncSession, patient_id: int) -> bool:
+    """
+    Проверка, прошел ли пациент онбординг.
+    Флаг онбординга — наличие хотя бы одной записи боли.
+    """
+    try:
+        stmt = select(PainLog.id).where(PainLog.patient_id == patient_id).limit(1)
+        result = await session.scalar(stmt)
+        return result is not None
+    except SQLAlchemyError as e:
+        logger.error(f"[has_pain_log] patient_id={patient_id}: {e}")
+        return False
+
+
+# ================================================================
+# ЛОГИ ПИТАНИЯ (MealLog)
+# ================================================================
+
+async def add_meal_log(
+    session: AsyncSession,
+    patient_id: int,
+    text: str,
+    kbju: Dict[str, float]
+) -> Optional[MealLog]:
+    try:
+        log = MealLog(
+            patient_id=patient_id,
+            original_text=text,
+            calories=kbju.get("calories"),
+            proteins=kbju.get("proteins"),
+            fats=kbju.get("fats"),
+            carbs=kbju.get("carbs"),
+        )
+        session.add(log)
+        await session.commit()
+        await session.refresh(log)
+        return log
+    except SQLAlchemyError as e:
+        await session.rollback()
+        logger.error(f"[add_meal_log] patient_id={patient_id}: {e}")
+        return None
+
+
+async def get_meal_logs(session: AsyncSession, patient_id: int, limit: int = 10) -> Sequence[MealLog]:
+    """Последние N записей питания для отображения в прогрессе."""
+    try:
+        stmt = (
+            select(MealLog)
+            .where(MealLog.patient_id == patient_id)
+            .order_by(MealLog.created_at.desc())
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        return result.scalars().all()
+    except SQLAlchemyError as e:
+        logger.error(f"[get_meal_logs] patient_id={patient_id}: {e}")
+        return []
+
+
+# ================================================================
+# ЛОГИ ТРЕНИРОВОК (WorkoutLog)
+# ================================================================
+
+async def add_workout_log(
+    session: AsyncSession,
+    patient_id: int,
+    rating: int,
+    repetitions: int
+) -> Optional[WorkoutLog]:
+    try:
+        log = WorkoutLog(patient_id=patient_id, rating=rating, repetitions=repetitions)
+        session.add(log)
+        await session.commit()
+        await session.refresh(log)
+        return log
+    except SQLAlchemyError as e:
+        await session.rollback()
+        logger.error(f"[add_workout_log] patient_id={patient_id}: {e}")
+        return None
+
+
+async def get_workout_logs(session: AsyncSession, patient_id: int, limit: int = 7) -> Sequence[WorkoutLog]:
+    """Последние N тренировок. Используется для отображения прогресса."""
+    try:
+        stmt = (
+            select(WorkoutLog)
+            .where(WorkoutLog.patient_id == patient_id)
+            .order_by(WorkoutLog.created_at.desc())
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        return result.scalars().all()
+    except SQLAlchemyError as e:
+        logger.error(f"[get_workout_logs] patient_id={patient_id}: {e}")
+        return []

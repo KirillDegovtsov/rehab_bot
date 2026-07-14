@@ -1,80 +1,103 @@
-from aiogram import Router
-from aiogram.types import Message
-from aiogram.filters import Command
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
-from database import async_session_maker, crud
-from utils import format_rehab_plan_text
+# Импорты клавиатур, сервисов и CRUD (тут нужно импортировать твои модули)
+from keyboards.patient_kb import (patient_main_kb, disclaimer_kb, pain_scale_kb, 
+                                  mobility_kb, workout_rating_kb, meal_confirm_kb)
+from services.rag_service import ask_rag_assistant, recognize_meal
+# from database.database import async_session_maker
+# from database.crud import add_pain_log, add_workout_log
 
-router = Router()
+patient_router = Router()
 
+class PatientOnboardingFSM(StatesGroup):
+    waiting_name = State()
+    waiting_disclaimer = State()
+    waiting_pain_level = State()
+    waiting_mobility = State()
 
-@router.message(Command("start"))
-async def patient_start(message: Message, state: FSMContext):
-    """
-    При /start пациент регистрирует свой chat_id в БД по username.
-    Если план уже одобрен — сразу отправляем его.
-    Если нет — сообщаем что план ещё не готов.
-    """
-    username = message.from_user.username
+class PatientMenuFSM(StatesGroup):
+    main_menu = State()
 
-    if not username:
-        await message.answer(
-            "👋 Добро пожаловать!\n\n"
-            "⚠️ У вас не установлен username в Telegram. "
-            "Попросите вашего врача уточнить как вас найти в системе."
-        )
+class PatientMealFSM(StatesGroup):
+    waiting_meal_text = State()
+    waiting_confirmation = State()
+
+class PatientWorkoutFSM(StatesGroup):
+    waiting_rating = State()
+    waiting_reps = State()
+
+class PatientRAGFSM(StatesGroup):
+    waiting_rag_question = State()
+
+# --- Модуль 1 (Онбординг) ---
+@patient_router.message(CommandStart())
+async def cmd_start_patient(message: Message, state: FSMContext):
+    # TODO: Получить данные пользователя через CRUD
+    is_registered = True 
+    has_pain_level = False # Проверка пройден ли онбординг
+    
+    if is_registered and not has_pain_level:
+        await message.answer("Пожалуйста, введите ваше имя:")
+        await state.set_state(PatientOnboardingFSM.waiting_name)
+    else:
+        await message.answer("Главное меню", reply_markup=patient_main_kb())
+
+@patient_router.message(StateFilter(PatientOnboardingFSM.waiting_name), F.text)
+async def process_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Ознакомьтесь с условиями использования.", reply_markup=disclaimer_kb())
+    await state.set_state(PatientOnboardingFSM.waiting_disclaimer)
+
+@patient_router.callback_query(StateFilter(PatientOnboardingFSM.waiting_disclaimer), F.data == "disclaimer_accept")
+async def process_disclaimer(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text("Оцените ваш уровень боли от 0 до 10:", reply_markup=pain_scale_kb())
+    await state.set_state(PatientOnboardingFSM.waiting_pain_level)
+
+@patient_router.callback_query(StateFilter(PatientOnboardingFSM.waiting_pain_level), F.data.startswith("pain_"))
+async def process_pain(call: CallbackQuery, state: FSMContext):
+    pain_level = int(call.data.split("_")[1])
+    await state.update_data(pain_level=pain_level)
+    
+    # async with async_session_maker() as session:
+    #     await add_pain_log(session, patient_id=call.from_user.id, pain_level=pain_level)
+        
+    await call.message.edit_text("Как вы передвигаетесь?", reply_markup=mobility_kb())
+    await state.set_state(PatientOnboardingFSM.waiting_mobility)
+    
+@patient_router.callback_query(StateFilter(PatientOnboardingFSM.waiting_mobility), F.data.startswith("mob_"))
+async def process_mobility(call: CallbackQuery, state: FSMContext):
+    mobility = call.data.split("_")[1]
+    await call.message.edit_text("Регистрация завершена! Добро пожаловать.", reply_markup=patient_main_kb())
+    await state.clear()
+
+# --- Модуль 3 и 4 (Питание и Тренировки) ---
+@patient_router.message(StateFilter(PatientWorkoutFSM.waiting_rating), F.data.startswith("workout_rating_"))
+async def process_workout_rating(call: CallbackQuery, state: FSMContext):
+    rating = int(call.data.split("_")[2])
+    await state.update_data(rating=rating)
+    await call.message.edit_text("Сколько повторений вы выполнили?")
+    await state.set_state(PatientWorkoutFSM.waiting_reps)
+
+# --- Модуль 5 (RAG-ассистент) ---
+@patient_router.message(F.text == "Задать вопрос ассистенту")
+async def start_rag_assistant(message: Message, state: FSMContext):
+    await message.answer("Задайте вопрос. Для выхода напишите 'Назад'.")
+    await state.set_state(PatientRAGFSM.waiting_rag_question)
+
+@patient_router.message(StateFilter(PatientRAGFSM.waiting_rag_question), F.text)
+async def process_rag_question(message: Message, state: FSMContext):
+    if message.text.lower() == "назад":
+        await message.answer("Вы в главном меню.", reply_markup=patient_main_kb())
+        await state.clear()
         return
-
-    async with async_session_maker() as session:
-        patient = await crud.get_patient_by_username(session, username)
-
-        if not patient:
-            await message.answer(
-                "👋 Добро пожаловать!\n\n"
-                "Вы пока не зарегистрированы в системе реабилитации. "
-                "Обратитесь к вашему лечащему врачу — "
-                "он добавит вас в систему."
-            )
-            return
-
-        # Сохраняем chat_id чтобы врач мог отправлять уведомления
-        if patient.chat_id != message.from_user.id:
-            await crud.update_patient(
-                session,
-                patient.id,
-                {"chat_id": message.from_user.id}
-            )
-
-        # Проверяем наличие активного плана
-        plan = await crud.get_rehab_plan(session, patient.id)
-
-        if plan and plan.status == "active":
-            formatted_text = format_rehab_plan_text(
-                plan.exercises_json,
-                plan.nutrition_json
-            )
-            await message.answer(
-                f"👋 Добро пожаловать, {patient.name}!\n\n"
-                f"✅ Ваш план реабилитации уже готов:\n\n"
-                f"{formatted_text}",
-                parse_mode="Markdown"
-            )
-        else:
-            await message.answer(
-                f"👋 Добро пожаловать, {patient.name}!\n\n"
-                "⏳ Ваш лечащий врач ещё не составил план реабилитации. "
-                "Как только план будет готов и утверждён — "
-                "вы получите уведомление прямо здесь."
-            )
-
-
-@router.message()
-async def patient_unknown_message(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state is not None:
-        return
-    await message.answer(
-        "⚠️ Неизвестная команда. "
-        "Если у вас есть вопросы — обратитесь к вашему лечащему врачу."
-    )
+        
+    # TODO: Вытащить профиль из БД
+    profile = {"diagnosis": "Травма колена", "mobility": "Костыли"}
+    
+    wait_msg = await message.answer("⏳ Анализирую базу знаний...")
+    answer = await ask_rag_assistant(message.text, profile)
+    await wait_msg.edit_text(answer)

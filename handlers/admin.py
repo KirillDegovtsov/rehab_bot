@@ -4,6 +4,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.filters import Command, StateFilter
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
+import re
 
 from keyboards.admin_kb import (
     admin_main_menu_kb, 
@@ -45,7 +46,7 @@ async def process_admin_back_button(
 
     elif current_state == AddDoctorFSM.fio.state:
         await state.set_state(AddDoctorFSM.username)
-        await message.answer("Введите username врача (без @):", reply_markup=back_kb())
+        await message.answer("Введите username врача (начиная с @):", reply_markup=back_kb())
 
     elif current_state == EditDoctorFSM.waiting_value.state:
         data = await state.get_data()
@@ -55,7 +56,8 @@ async def process_admin_back_button(
         async with session_maker() as session:
             doctor = await crud.get_doctor_by_id(session, doctor_id)
             
-        text = f"👨‍⚕️ Врач: {doctor.fio}\nID: {doctor.id}\nUsername: @{doctor.username}"
+        # Убрали ID из карточки
+        text = f"👨‍⚕️ Врач: {doctor.fio}\nUsername: @{doctor.username}"
         
         await message.answer("Отмена редактирования.", reply_markup=ReplyKeyboardRemove())
         await message.answer(text, reply_markup=doctor_card_kb(doctor_id))
@@ -107,7 +109,8 @@ async def cq_doctor_card(
     async with session_maker() as session:
         doctor = await crud.get_doctor_by_id(session, callback_data.doctor_id)
         
-    text = f"👨‍⚕️ Врач: {doctor.fio}\nID: {doctor.id}\nUsername: @{doctor.username}"
+    # Убрали ID
+    text = f"👨‍⚕️ Врач: {doctor.fio}\nUsername: @{doctor.username}"
     await callback.message.edit_text(text, reply_markup=doctor_card_kb(doctor_id=doctor.id))
 
 
@@ -115,7 +118,7 @@ async def cq_doctor_card(
 async def cq_add_doctor_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AddDoctorFSM.username)
     await callback.message.delete()
-    await callback.message.answer("Введите username нового врача (без @):", reply_markup=back_kb())
+    await callback.message.answer("Введите username нового врача (начиная с @):", reply_markup=back_kb())
 
 
 @router.message(StateFilter(AddDoctorFSM.username), F.text)
@@ -124,18 +127,25 @@ async def process_add_doctor_username(
     state: FSMContext, 
     session_maker: async_sessionmaker[AsyncSession]
 ) -> None:
-    username = message.text.replace("@", "").strip()
+    username = message.text.strip()
+
+    # ВАЛИДАЦИЯ: строго начинается с @, далее английские буквы (разрешены цифры и _ как в самом Telegram)
+    if not re.match(r"^@[A-Za-z0-9_]+$", username):
+        await message.answer("⚠️ Ошибка! Ник должен начинаться с @ и содержать английские буквы. Повторите ввод:")
+        return
+
+    clean_username = username.replace("@", "")
 
     async with session_maker() as session:
-        is_exists = await crud.check_username_exists(session, username)
+        is_exists = await crud.check_username_exists(session, clean_username)
         
     if is_exists:
         await message.answer("⚠️ Этот username уже зарегистрирован. Введите другой:")
         return
 
-    await state.update_data(new_doc_username=username)
+    await state.update_data(new_doc_username=clean_username)
     await state.set_state(AddDoctorFSM.fio)
-    await message.answer("Введите ФИО врача:", reply_markup=back_kb())
+    await message.answer("Введите ФИО врача (2-3 слова на русском языке):", reply_markup=back_kb())
 
 
 @router.message(StateFilter(AddDoctorFSM.fio), F.text)
@@ -145,8 +155,10 @@ async def process_add_doctor_fio(
     session_maker: async_sessionmaker[AsyncSession]
 ) -> None:
     fio = message.text.strip()
-    if not fio:
-        await message.answer("⚠️ ФИО не может быть пустым. Повторите ввод:")
+    
+    # ВАЛИДАЦИЯ: 2 или 3 слова строго на русском языке
+    if not re.match(r"^[А-Яа-яЁё]+\s+[А-Яа-яЁё]+(?:\s+[А-Яа-яЁё]+)?$", fio):
+        await message.answer("⚠️ Ошибка! ФИО должно состоять из 2-3 слов строго на русском языке. Повторите ввод:")
         return
 
     data = await state.get_data()
@@ -170,7 +182,7 @@ async def cq_edit_doctor_start(
     await state.set_state(EditDoctorFSM.waiting_value)
     await state.update_data(edit_field=callback_data.field, doctor_id=callback_data.doctor_id)
 
-    field_name = "username (без @)" if callback_data.field == "username" else "ФИО"
+    field_name = "username (начиная с @)" if callback_data.field == "username" else "ФИО (2-3 слова на русском)"
     await callback.message.delete()
     await callback.message.answer(f"Введите новое значение для {field_name}:", reply_markup=back_kb())
 
@@ -187,34 +199,37 @@ async def process_edit_doctor_value(
     new_value = message.text.strip()
 
     if field == "username":
-        new_value = new_value.replace("@", "")
+        if not re.match(r"^@[A-Za-z0-9_]+$", new_value):
+            await message.answer("⚠️ Ошибка! Ник должен начинаться с @ и содержать английские буквы. Повторите ввод:")
+            return
+            
+        clean_value = new_value.replace("@", "")
         async with session_maker() as session:
-            is_exists = await crud.check_username_exists(session, new_value, exclude_id=doctor_id)
+            is_exists = await crud.check_username_exists(session, clean_value, exclude_id=doctor_id)
         if is_exists:
             await message.answer("⚠️ Этот username уже занят. Введите другой:")
             return
+        new_value = clean_value
 
-    if field == "fio" and not new_value:
-        await message.answer("⚠️ ФИО не может быть пустым. Введите корректное ФИО:")
-        return
+    if field == "fio":
+        if not re.match(r"^[А-Яа-яЁё]+\s+[А-Яа-яЁё]+(?:\s+[А-Яа-яЁё]+)?$", new_value):
+            await message.answer("⚠️ Ошибка! ФИО должно состоять из 2-3 слов строго на русском языке. Введите корректное ФИО:")
+            return
 
     async with session_maker() as session:
         await crud.update_doctor_field(session, doctor_id, field, new_value)
         doctor = await crud.get_doctor_by_id(session, doctor_id)
 
     await state.set_state(AdminNavigationFSM.doctor_card)
-    text = f"👨‍⚕️ Врач: {doctor.fio}\nID: {doctor.id}\nUsername: @{doctor.username}"
+    
+    # Убрали ID
+    text = f"👨‍⚕️ Врач: {doctor.fio}\nUsername: @{doctor.username}"
     
     await message.answer("✅ Данные успешно обновлены!", reply_markup=ReplyKeyboardRemove())
     await message.answer(text, reply_markup=doctor_card_kb(doctor_id))
 
 
-# Обновленный обработчик неизвестных сообщений с возвратом кнопок
-@router.message(StateFilter(
-    AdminNavigationFSM.main_menu, 
-    AdminNavigationFSM.doctors_list, 
-    AdminNavigationFSM.doctor_card
-))
+@router.message()
 async def process_unknown_message(
     message: Message, 
     state: FSMContext,
@@ -223,25 +238,44 @@ async def process_unknown_message(
     try:
         await message.delete()
     except Exception:
-        pass  
+        pass
 
     current_state = await state.get_state()
     warning_text = "⚠️ Пожалуйста, используйте кнопки меню.\n\n"
 
-    # Заново отрисовываем меню в зависимости от текущего стейта
-    if current_state == AdminNavigationFSM.main_menu.state:
-        await message.answer(warning_text + "Выберите действие:", reply_markup=admin_main_menu_kb())
-        
+    # None — стейт не установлен (например, после рестарта бота)
+    if current_state is None or current_state == AdminNavigationFSM.main_menu.state:
+        await state.set_state(AdminNavigationFSM.main_menu)
+        await message.answer(
+            warning_text + "Выберите действие:", 
+            reply_markup=admin_main_menu_kb()
+        )
+
     elif current_state == AdminNavigationFSM.doctors_list.state:
         async with session_maker() as session:
             doctors = await crud.get_all_doctors(session)
-        await message.answer(warning_text + "Список врачей:", reply_markup=doctors_list_kb(doctors))
-        
+        await message.answer(
+            warning_text + "Список врачей:", 
+            reply_markup=doctors_list_kb(doctors)
+        )
+
     elif current_state == AdminNavigationFSM.doctor_card.state:
         data = await state.get_data()
         doctor_id = data.get("doctor_id")
         if doctor_id:
             async with session_maker() as session:
                 doctor = await crud.get_doctor_by_id(session, doctor_id)
-            text = f"{warning_text}👨‍⚕️ Врач: {doctor.fio}\nID: {doctor.id}\nUsername: @{doctor.username}"
+            # ID убран из карточки
+            text = f"{warning_text}👨‍⚕️ Врач: {doctor.fio}\nUsername: @{doctor.username}"
             await message.answer(text, reply_markup=doctor_card_kb(doctor_id))
+        else:
+            # doctor_id потерялся — откатываемся в главное меню
+            await state.set_state(AdminNavigationFSM.main_menu)
+            await message.answer(
+                "⚠️ Произошла ошибка. Возврат в главное меню.", 
+                reply_markup=admin_main_menu_kb()
+            )
+
+    else:
+        # Стейт AddDoctorFSM или EditDoctorFSM — просим завершить действие
+        await message.answer("Пожалуйста, завершите текущее действие или нажмите 🔙 Назад.")

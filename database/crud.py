@@ -188,3 +188,60 @@ async def add_doctor(session: AsyncSession, username: str, fio: str):
 async def get_doctor_by_username(session: AsyncSession, username: str) -> Doctor | None:
     return await session.scalar(select(Doctor).where(Doctor.username == username))
 
+
+
+# Добавьте эти функции в конец файла database/crud.py
+
+async def get_all_doctors(session: AsyncSession):
+    """Получает список всех врачей из БД."""
+    result = await session.execute(select(Doctor))
+    return result.scalars().all()
+
+
+async def get_doctor_by_id(session: AsyncSession, doctor_id: int) -> Doctor | None:
+    """Получает врача по ID."""
+    result = await session.execute(select(Doctor).where(Doctor.id == doctor_id))
+    return result.scalar_one_or_none()
+
+
+async def check_username_exists(session: AsyncSession, username: str, exclude_id: int = None) -> bool:
+    """Проверяет, занят ли username врачом, пациентом или админом."""
+    clean_username = username.strip().lower().replace('@', '')
+    
+    # Ищем врача с таким username
+    doc_stmt = select(Doctor).where(Doctor.username == clean_username)
+    if exclude_id:
+        doc_stmt = doc_stmt.where(Doctor.id != exclude_id)
+        
+    doc = await session.scalar(doc_stmt)
+    if doc:
+        return True
+        
+    # Также проверим, что username не занят админом или пациентом
+    if await session.scalar(select(Admin).where(Admin.username == clean_username)):
+        return True
+    if await session.scalar(select(Patient).where(Patient.username == clean_username)):
+        return True
+        
+    return False
+
+
+async def create_doctor(session: AsyncSession, username: str, fio: str) -> Doctor:
+    """Создает нового врача (замена add_doctor для консистентности)."""
+    clean_username = username.strip().lower().replace('@', '')
+    doctor = Doctor(username=clean_username, fio=fio)
+    session.add(doctor)
+    await session.commit()
+    await session.refresh(doctor)
+    return doctor
+
+
+async def update_doctor_field(session: AsyncSession, doctor_id: int, field: str, new_value: str) -> None:
+    """Обновляет определенное поле врача."""
+    doctor = await get_doctor_by_id(session, doctor_id)
+    if doctor:
+        if field == "username":
+            setattr(doctor, field, new_value.strip().lower().replace('@', ''))
+        else:
+            setattr(doctor, field, new_value)
+        await session.commit()

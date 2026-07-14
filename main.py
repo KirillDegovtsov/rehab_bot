@@ -67,7 +67,9 @@ async def main() -> None:
 
     await bot.delete_webhook(drop_pending_updates=True)
     logging.info("Бот запущен и готов к работе")
-    await dp.start_polling(bot)
+    
+    # ИСПРАВЛЕНИЕ DI: Прокидываем session_maker во все хэндлеры и мидлвари
+    await dp.start_polling(bot, session_maker=async_session_maker)
 
 
 if __name__ == "__main__":

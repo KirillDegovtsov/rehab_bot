@@ -662,18 +662,15 @@ def validate_russian_text(text: str) -> tuple[bool, str]:
 # ===========================================================================
 
 @router.message(Command("start"))
-async def cmd_start_doctor(message: Message, state: FSMContext):
+async def cmd_start_doctor(message: Message, state: FSMContext, username: str):
     await state.clear()
     async with async_session_maker() as session:
         await crud.get_or_create_doctor(
-            session, message.from_user.id, message.from_user.full_name
+            session,
+            tg_id=message.from_user.id,
+            fio=message.from_user.full_name,
+            username=username,  # приходит из AuthMiddleware через data['username']
         )
-    await message.answer(
-        "👨‍⚕️ Добро пожаловать в панель лечащего врача.",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    await _send_main_menu(message)
-    await state.set_state(MenuNavigationFSM.main_menu)  # ← НОВОЕ
 
 
 @router.callback_query(F.data == "menu_add_patient")

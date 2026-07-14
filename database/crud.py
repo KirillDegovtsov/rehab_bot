@@ -3,17 +3,49 @@ from sqlalchemy import select
 from .models import Doctor, Patient, RehabPlan, MedicationPlan, Admin
 from sqlalchemy.orm.attributes import flag_modified
 from database.models import MedicationPlan  # Добавь к уже существующим импортам моделей
+from sqlalchemy.exc import IntegrityError  # добавить в импорты
 
 
-async def get_or_create_doctor(session: AsyncSession, tg_id: int, fio: str) -> Doctor:
-    stmt = select(Doctor).where(Doctor.telegram_id == tg_id)
-    result = await session.execute(stmt)
-    doctor = result.scalar_one_or_none()
+async def get_or_create_doctor(
+    session: AsyncSession, tg_id: int, fio: str, username: str
+) -> Doctor:
+    # 1. Ищем по telegram_id (повторный /start)
+    doctor = await session.scalar(
+        select(Doctor).where(Doctor.telegram_id == tg_id)
+    )
+
+    # 2. Если не нашли — ищем по username (врач добавлен админом, ещё не логинился)
     if not doctor:
-        doctor = Doctor(telegram_id=tg_id, fio=fio)
+        doctor = await session.scalar(
+            select(Doctor).where(Doctor.username == username)
+        )
+
+    if doctor:
+        # Обновляем поля, которые могли быть пустыми при создании через admin
+        updated = False
+        if doctor.telegram_id is None and tg_id:
+            doctor.telegram_id = tg_id
+            updated = True
+        if not doctor.fio and fio:
+            doctor.fio = fio
+            updated = True
+        if updated:
+            await session.commit()
+        return doctor
+
+    # 3. Врача нет вообще — создаём (защита от гонок через try/except)
+    try:
+        doctor = Doctor(username=username, telegram_id=tg_id, fio=fio)
         session.add(doctor)
         await session.commit()
-    return doctor
+        return doctor
+    except IntegrityError:
+        await session.rollback()
+        # Кто-то успел вставить между SELECT и INSERT — просто читаем
+        doctor = await session.scalar(
+            select(Doctor).where(Doctor.username == username)
+        )
+        return doctor
 
 
 async def create_patient(session: AsyncSession, doctor_id: int, patient_data: dict) -> Patient:
@@ -131,7 +163,7 @@ async def update_medications(session: AsyncSession, patient_id: int, new_list: l
 
 
 async def bootstrap_admin(session: AsyncSession, admin_username: str):
-    username_clean = admin_username.lower().replace('@', '')
+    username_clean = admin_username.strip().lower().replace('@', '')  # добавлен .strip()
     admin = await session.scalar(select(Admin).where(Admin.username == username_clean))
     if not admin:
         admin = Admin(username=username_clean)
@@ -139,6 +171,7 @@ async def bootstrap_admin(session: AsyncSession, admin_username: str):
         await session.commit()
 
 async def get_user_role(session: AsyncSession, username: str) -> str | None:
+    username = username.strip().lower().replace('@', '')  # добавить эту строку вверху
     if await session.scalar(select(Admin).where(Admin.username == username)):
         return 'admin'
     if await session.scalar(select(Doctor).where(Doctor.username == username)):
